@@ -1,69 +1,39 @@
+import math
+from typing import Optional, Union
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ============================================================
-# TimeEmbedding: sinusoidal positional embedding untuk timestep
-# ------------------------------------------------------------
-# Mengubah skalar timestep t (0..T) menjadi vektor berdimensi `dim`
-# menggunakan frekuensi geometris: ω_i = 1/10000^(2i/dim)
-# Output: (B, dim)
+#  Sinusoidal Positional Embedding (sesuai repo asli)
 # ============================================================
-class TimeEmbedding(nn.Module):
-    def __init__(self, dim: int, device: str | torch.device = "cpu"):
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-        self.device = device
-        half = dim // 2
-        # inv_freq[i] = 1 / 10000^(2i/dim) untuk i = 0..half-1
-        self.inv_freq = 1.0 / (10000 ** (2 * torch.arange(half).float() / dim))
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        # t: (B,) -> emb_time: (B, dim)
-        emb_time = torch.zeros(t.size(0), self.dim, device=self.device)
-        # indeks genap: sin, indeks ganjil: cos
-        emb_time[:, 0::2] = torch.sin(t.unsqueeze(1) * self.inv_freq)
-        emb_time[:, 1::2] = torch.cos(t.unsqueeze(1) * self.inv_freq)
-        return emb_time
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
 
 
 # ============================================================
-# FiLM (Feature-wise Linear Modulation)
-# ------------------------------------------------------------
-# Mengubah vektor kondisi `cond` (B, cond_dim) menjadi
-# scale dan bias per channel: (B, channels, 1)
-# Lalu memodulasi hidden feature h: out = h * scale + bias
-# ============================================================
-class FiLM(nn.Module):
-    def __init__(self, cond_dim: int, channels: int, device: str | torch.device = "cpu"):
-        super().__init__()
-        self.cond_encoder = nn.Sequential(
-            nn.Mish(),                    # aktivasi non-linear
-            nn.Linear(cond_dim, 2 * channels)  # output: scale + bias
-        )
-
-    def forward(self, cond, h):
-        # cond: (B, cond_dim), h: (B, C, L)
-        params = self.cond_encoder(cond)           # (B, 2*C)
-        scale, bias = params.chunk(2, dim=1)       # masing-masing (B, C)
-        scale = scale.unsqueeze(-1)                # (B, C, 1)
-        bias = bias.unsqueeze(-1)                  # (B, C, 1)
-        return h * scale + bias                    # broadcast di L -> (B, C, L)
-
-
-# ============================================================
-# Conv1dBlock: Conv1d -> GroupNorm -> Mish
-# ------------------------------------------------------------
-# Blok bangunan dasar CNN 1D. Padding kernel//2 mempertahankan
-# panjang sekuens L. GroupNorm stabil untuk batch kecil.
+#  Conv1dBlock: Conv -> GroupNorm -> Mish
 # ============================================================
 class Conv1dBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, n_groups=8):
+    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
             nn.GroupNorm(n_groups, out_channels),
-            nn.Mish()
+            nn.Mish(),
         )
 
     def forward(self, x):
@@ -71,50 +41,20 @@ class Conv1dBlock(nn.Module):
 
 
 # ============================================================
-# ConditionalResidualBlock1d
-# ------------------------------------------------------------
-# Blok residual dengan FiLM conditioning.
-# Alur: x -> block1 -> FiLM(cond) -> block2 -> + residual -> out
-# Jika in_channels != out_channels, residual lewat Conv1d kernel 1.
-# ============================================================
-class ConditionalResidualBlock1d(nn.Module):
-    def __init__(self, in_channels, out_channels, cond_dim,
-                 kernel_size=3, n_groups=8, device: str | torch.device = "cpu"):
-        super().__init__()
-        self.block1 = Conv1dBlock(in_channels, out_channels, kernel_size, n_groups)
-        self.film = FiLM(cond_dim, out_channels, device)
-        self.block2 = Conv1dBlock(out_channels, out_channels, kernel_size, n_groups)
-        # residual: Identity jika channel sama, Conv1d kernel 1 jika beda
-        self.residual_conv = (nn.Conv1d(in_channels, out_channels, 1)
-                              if in_channels != out_channels else nn.Identity())
-
-    def forward(self, cond, h):
-        # cond: (B, cond_dim), h: (B, C, L)
-        x = self.block1(h)           # (B, out_channels, L)
-        x = self.film(cond, x)       # modulasi FiLM
-        x = self.block2(x)           # (B, out_channels, L)
-        return x + self.residual_conv(h)  # residual connection
-
-
-# ============================================================
-# Downsample1d: Conv1d stride 2 -> panjang sekuens jadi setengah
+#  Downsample / Upsample (kernel sesuai repo asli)
 # ============================================================
 class Downsample1d(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)  # kernel=3, stride=2, padding=1
+        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
 
     def forward(self, x):
         return self.conv(x)
 
 
-# ============================================================
-# Upsample1d: ConvTranspose1d stride 2 -> panjang sekuens jadi 2x
-# ============================================================
 class Upsample1d(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        # kernel=4, stride=2, padding=1 -> output length = 2 * input length
         self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
 
     def forward(self, x):
@@ -122,139 +62,220 @@ class Upsample1d(nn.Module):
 
 
 # ============================================================
-# ConditionalUnet1D: U-Net 1D kondisional untuk noise prediction
-# ------------------------------------------------------------
-# Arsitektur:
-#   input_proj -> Down path (ResBlock + Downsample) x N
-#   -> Mid (2x ResBlock) -> Up path (Upsample + ResBlock + skip concat) x N
-#   -> output_proj -> prediksi noise ε_θ
-# Kondisi: timestep embedding (+ optional global_cond) -> FiLM di tiap ResBlock
+#  FiLM Conditioning Residual Block (sesuai repo asli)
+#  h = h + cond_emb  (cond_predict_scale=False, DEFAULT)
+#  atau scale,bias = split; h = h*(1+scale) + bias  (True)
+# ============================================================
+class ConditionalResidualBlock1d(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        cond_dim,
+        kernel_size=3,
+        n_groups=8,
+        cond_predict_scale=False,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups),
+            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups),
+        ])
+
+        cond_channels = out_channels
+        if cond_predict_scale:
+            cond_channels = out_channels * 2
+        self.cond_predict_scale = cond_predict_scale
+        self.out_channels = out_channels
+        self.cond_encoder = nn.Sequential(
+            nn.Mish(),
+            nn.Linear(cond_dim, cond_channels),
+            nn.Unflatten(-1, (-1, 1)),
+        )
+
+        self.residual_conv = (
+            nn.Conv1d(in_channels, out_channels, 1)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(self, x, cond):
+        out = self.blocks[0](x)
+        embed = self.cond_encoder(cond)
+        if self.cond_predict_scale:
+            embed = embed.reshape(embed.shape[0], 2, self.out_channels, 1)
+            scale = embed[:, 0, ...]
+            bias = embed[:, 1, ...]
+            out = scale * out + bias
+        else:
+            out = out + embed
+        out = self.blocks[1](out)
+        out = out + self.residual_conv(x)
+        return out
+
+
+# ============================================================
+#  ConditionalUnet1D — 1:1 dengan real-stanford/diffusion_policy
 # ============================================================
 class ConditionalUnet1D(nn.Module):
     def __init__(
         self,
-        input_dim,              # action_dim (mis. 2 untuk x,y)
-        global_cond_dim,        # dimensi embedding observasi (state), None jika tidak pakai
-        diffusion_step_embed_dim=256,   # dimensi embedding timestep
-        down_dims=(256, 512, 1024),     # channel di setiap level downsampling
-        kernel_size=3,
+        input_dim,
+        global_cond_dim,
+        local_cond_dim=None,
+        diffusion_step_embed_dim=256,
+        down_dims=(256, 512, 1024),
+        kernel_size=5,
         n_groups=8,
+        cond_predict_scale=True,  # default kita: True agar cocok skripsi CPU Anda
     ):
         super().__init__()
-        all_dims = [input_dim] + list(down_dims)   # [input_dim, 256, 512, 1024]
-        self.down_dims = down_dims
+        all_dims = [input_dim] + list(down_dims)
+        start_dim = down_dims[0]
 
-        # ----------------------------------------------------
-        # 1) Timestep embedding: t -> sinusoidal -> MLP -> (B, dsed)
-        # ----------------------------------------------------
         dsed = diffusion_step_embed_dim
-        self.diffusion_step_encoder = nn.Sequential(
-            TimeEmbedding(dsed),              # sinusoidal embedding
+        diffusion_step_encoder = nn.Sequential(
+            SinusoidalPosEmb(dsed),
             nn.Linear(dsed, dsed * 4),
             nn.Mish(),
-            nn.Linear(dsed * 4, dsed),        # output: (B, dsed)
+            nn.Linear(dsed * 4, dsed),
         )
         cond_dim = dsed
         if global_cond_dim is not None:
-            cond_dim += global_cond_dim  # global_cond dikirim di forward
+            cond_dim += global_cond_dim
 
-        # ----------------------------------------------------
-        # 2) Input projection: (B, action_dim, L) -> (B, down_dims[0], L)
-        # ----------------------------------------------------
-        self.input_proj = nn.Conv1d(input_dim, down_dims[0], 1)
+        in_out = list(zip(all_dims[:-1], all_dims[1:]))
 
-        # ----------------------------------------------------
-        # 3) Down path: ResBlock + Downsample
-        #    skip connection disimpan SETELAH block, SEBELUM downsample
-        # ----------------------------------------------------
-        self.down_blocks = nn.ModuleList()
-        self.down_samples = nn.ModuleList()
-        for i in range(len(down_dims) - 1):
-            self.down_blocks.append(
+        # --- local cond encoder (opsional) ---
+        local_cond_encoder = None
+        if local_cond_dim is not None:
+            _, dim_out = in_out[0]
+            dim_in = local_cond_dim
+            local_cond_encoder = nn.ModuleList([
                 ConditionalResidualBlock1d(
-                    down_dims[i], down_dims[i + 1], cond_dim
-                )
-            )
-            self.down_samples.append(Downsample1d(down_dims[i + 1]))
-
-        # ----------------------------------------------------
-        # 4) Mid blocks (bottleneck)
-        # ----------------------------------------------------
-        mid_dim = down_dims[-1]          # channel di bottleneck
-        self.mid_block1 = ConditionalResidualBlock1d(mid_dim, mid_dim, cond_dim)
-        self.mid_block2 = ConditionalResidualBlock1d(mid_dim, mid_dim, cond_dim)
-
-        # ----------------------------------------------------
-        # 5) Up path: Upsample + concat skip + ResBlock
-        #    channel input up_block = channel_up * 2 (karena concat skip)
-        # ----------------------------------------------------
-        self.up_blocks = nn.ModuleList()
-        self.up_samples = nn.ModuleList()
-        for i in range(len(down_dims) - 1):
-            self.up_samples.append(Upsample1d(down_dims[-1 - i]))
-            self.up_blocks.append(
+                    dim_in, dim_out, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
                 ConditionalResidualBlock1d(
-                    down_dims[-1 - i] * 2,   # concat skip -> channel x2
-                    down_dims[-2 - i],        # output channel level berikutnya
-                    cond_dim,
-                )
-            )
+                    dim_in, dim_out, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
+            ])
 
-        # ----------------------------------------------------
-        # 6) Output projection: (B, down_dims[0], L) -> (B, action_dim, L)
-        # ----------------------------------------------------
-        self.output_proj = nn.Conv1d(down_dims[0], input_dim, 1)
+        # --- mid ---
+        mid_dim = all_dims[-1]
+        self.mid_modules = nn.ModuleList([
+            ConditionalResidualBlock1d(
+                mid_dim, mid_dim, cond_dim=cond_dim,
+                kernel_size=kernel_size, n_groups=n_groups,
+                cond_predict_scale=cond_predict_scale),
+            ConditionalResidualBlock1d(
+                mid_dim, mid_dim, cond_dim=cond_dim,
+                kernel_size=kernel_size, n_groups=n_groups,
+                cond_predict_scale=cond_predict_scale),
+        ])
 
-    def forward(self, x, timestep, global_cond=None):
-        """
-        x: (B, action_dim, L)        - action chunk noisy
-        timestep: (B,)               - integer 0..T
-        global_cond: (B, global_cond_dim) or None - embedding observasi (state)
-        return: (B, action_dim, L)   - prediksi noise ε_θ
-        """
-        # 1) Timestep embedding
-        t_emb = self.diffusion_step_encoder(timestep)   # (B, dsed)
+        # --- down: 2 resblock + downsample per level ---
+        down_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            down_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1d(
+                    dim_in, dim_out, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
+                ConditionalResidualBlock1d(
+                    dim_out, dim_out, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
+                Downsample1d(dim_out) if not is_last else nn.Identity(),
+            ]))
 
-        # 2) Gabungkan dengan global_cond (observasi state)
-        if global_cond is not None:
-            cond = torch.cat([t_emb, global_cond], dim=1)  # (B, cond_dim)
-        else:
-            cond = t_emb
+        # --- up: 2 resblock + upsample per level ---
+        up_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (len(in_out) - 1)
+            up_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1d(
+                    dim_out * 2, dim_in, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
+                ConditionalResidualBlock1d(
+                    dim_in, dim_in, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale),
+                Upsample1d(dim_in) if not is_last else nn.Identity(),
+            ]))
 
-        # 3) Input projection
-        h = self.input_proj(x)      # (B, down_dims[0], L)
-
-        # 4) Down path
-        skips = []
-        for block, downsample in zip(self.down_blocks, self.down_samples):
-            h = block(cond, h)      # ResBlock + FiLM (cond first, then h)
-            skips.append(h)         # simpan skip SEBELUM downsample
-            h = downsample(h)       # panjang sekuens /2
-        
-        # 5) Mid (bottleneck)
-        h = self.mid_block1(cond, h)
-        h = self.mid_block2(cond, h)
-        
-        # 6) Up path
-        for upsample, block in zip(self.up_samples, self.up_blocks):
-            h = upsample(h)                     # panjang sekuens x2
-            skip = skips.pop()                  # ambil skip connection
-            h = torch.cat([h, skip], dim=1)     # concat di channel
-            h = block(cond, h)                  # ResBlock + FiLM
-        
-        # 7) Output projection
-        return self.output_proj(h)              # (B, action_dim, L)
-    
-class StateEncoder(nn.Module):
-    def __init__(self, state_dim: int = 5, hidden_dim: int = 256, out_dim: int = 256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Mish(),                    
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, out_dim),
+        final_conv = nn.Sequential(
+            Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
+            nn.Conv1d(start_dim, input_dim, 1),
         )
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.net(state)
+        self.diffusion_step_encoder = diffusion_step_encoder
+        self.local_cond_encoder = local_cond_encoder
+        self.up_modules = up_modules
+        self.down_modules = down_modules
+        self.final_conv = final_conv
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        global_cond: Optional[torch.Tensor] = None,
+        local_cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        sample:     (B, action_dim, T_a)
+        timestep:   (B,) atau skalar
+        global_cond:(B, global_cond_dim)
+        output:     (B, action_dim, T_a)
+        """
+        # 1. time embedding
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+        elif len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+        timesteps = timesteps.expand(sample.shape[0])
+
+        global_feature = self.diffusion_step_encoder(timesteps)
+        if global_cond is not None:
+            global_feature = torch.cat([global_feature, global_cond], dim=-1)
+
+        # 2. local cond (opsional)
+        h_local = []
+        if local_cond is not None and self.local_cond_encoder is not None:
+            resnet, resnet2 = self.local_cond_encoder
+            x = resnet(local_cond, global_feature)
+            h_local.append(x)
+            x = resnet2(local_cond, global_feature)
+            h_local.append(x)
+
+        # 3. down
+        x = sample
+        h = []
+        for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
+            x = resnet(x, global_feature)
+            if idx == 0 and len(h_local) > 0:
+                x = x + h_local[0]
+            x = resnet2(x, global_feature)
+            h.append(x)
+            x = downsample(x)
+
+        # 4. mid
+        for mid_module in self.mid_modules:
+            x = mid_module(x, global_feature)
+
+        # 5. up
+        for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
+            x = torch.cat((x, h.pop()), dim=1)
+            x = resnet(x, global_feature)
+            if idx == len(self.up_modules) - 1 and len(h_local) > 0:
+                x = x + h_local[1]
+            x = resnet2(x, global_feature)
+            x = upsample(x)
+
+        # 6. final
+        x = self.final_conv(x)
+        return x
