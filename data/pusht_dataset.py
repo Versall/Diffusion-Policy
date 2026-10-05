@@ -313,14 +313,24 @@ def split_train_val_dataset(
 ) -> Tuple[PushTStateDataset, PushTStateDataset]:
     """
     Split dataset jadi train/val berdasarkan episode (bukan frame).
-    Val set menggunakan normalisasi stats dari train set.
+    
+    FIX data leakage:
+    - Normalisasi stats (min/max) dihitung HANYA dari episode TRAIN.
+    - Stats train dipakai untuk normalize train DAN val.
+    - Val set tidak pernah "melihat" statistiknya sendiri.
     """
-    # Load episode ends untuk split (zarr v3 API)
+    # ============================================================
+    # 1. Load raw data + episode boundaries
+    # ============================================================
     dataset_root = zarr.open(store=zarr_path, mode='r')
     episode_ends = dataset_root['meta']['episode_ends'][:]
+    state_all = dataset_root['data']['state'][:].astype(np.float32)
+    action_all = dataset_root['data']['action'][:].astype(np.float32)
     n_episodes = len(episode_ends)
 
-    # Buat val mask
+    # ============================================================
+    # 2. Split episode jadi train/val
+    # ============================================================
     n_val = max(1, int(n_episodes * val_ratio))
     rng = np.random.default_rng(seed=seed)
     val_episode_idxs = rng.choice(n_episodes, size=n_val, replace=False)
@@ -328,12 +338,42 @@ def split_train_val_dataset(
     val_mask[val_episode_idxs] = True
     train_mask = ~val_mask
 
-    # Buat dataset penuh dulu untuk dapat stats
-    full_config = PushTDataConfig(pred_horizon, obs_horizon, action_horizon)
-    full_dataset = PushTStateDataset(zarr_path, full_config)
-    action_stats, state_stats = full_dataset.get_normalization_stats()
+    # ============================================================
+    # 3. Kumpulkan frame dari episode TRAIN saja (untuk stats)
+    # ============================================================
+    train_frame_mask = np.zeros(len(state_all), dtype=bool)
+    for i in range(n_episodes):
+        if not val_mask[i]:
+            start_idx = 0 if i == 0 else episode_ends[i - 1]
+            end_idx = episode_ends[i]
+            train_frame_mask[start_idx:end_idx] = True
 
-    # Buat indices untuk train & val terpisah
+    train_state = state_all[train_frame_mask]
+    train_action = action_all[train_frame_mask]
+
+    # ============================================================
+    # 4. Hitung stats HANYA dari frame TRAIN
+    # ============================================================
+    action_stats = get_data_stats(train_action)
+    state_stats = get_data_stats(train_state)
+
+    print(f"[Normalization] Stats computed from TRAIN ONLY "
+          f"({int(train_frame_mask.sum())}/{len(state_all)} frames)")
+    print(f"  action_stats: min={action_stats['min']}, max={action_stats['max']}")
+    print(f"  state_stats:  min={state_stats['min']},  max={state_stats['max']}")
+
+    # ============================================================
+    # 5. Normalize SEMUA frame pakai stats train-only
+    #    (val frames dinormalisasi dengan stats train — benar)
+    # ============================================================
+    normalized_data = {
+        'state': normalize_data(state_all, state_stats).astype(np.float32),
+        'action': normalize_data(action_all, action_stats).astype(np.float32),
+    }
+
+    # ============================================================
+    # 6. Build indices train & val
+    # ============================================================
     train_indices = []
     val_indices = []
 
@@ -352,39 +392,46 @@ def split_train_val_dataset(
             end_offset = (idx + pred_horizon + start_idx) - buffer_end_idx
             sample_start_idx = 0 + start_offset
             sample_end_idx = pred_horizon - end_offset
-            sample_info = [buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx]
+
+            sample_info = [buffer_start_idx, buffer_end_idx,
+                           sample_start_idx, sample_end_idx]
 
             if val_mask[i]:
                 val_indices.append(sample_info)
             else:
                 train_indices.append(sample_info)
 
-    # Buat dataset train dengan indices custom
-    train_dataset = PushTStateDataset.__new__(PushTStateDataset)
-    train_dataset.config = full_config
-    train_dataset.zarr_path = zarr_path
-    train_dataset.state_all = full_dataset.state_all
-    train_dataset.action_all = full_dataset.action_all
-    train_dataset.episode_ends = full_dataset.episode_ends
-    train_dataset.indices = np.array(train_indices, dtype=np.int64)
-    train_dataset.action_stats = action_stats
-    train_dataset.state_stats = state_stats
-    train_dataset.normalized_train_data = full_dataset.normalized_train_data
-    print(f"[Train] {len(train_dataset)} samples from {np.sum(train_mask)} episodes")
+    # ============================================================
+    # 7. Build datasets (pakai __new__ agar tidak recompute stats)
+    # ============================================================
+    config = PushTDataConfig(pred_horizon, obs_horizon, action_horizon)
 
-    val_dataset = PushTStateDataset.__new__(PushTStateDataset)
-    val_dataset.config = full_config
-    val_dataset.zarr_path = zarr_path
-    val_dataset.state_all = full_dataset.state_all
-    val_dataset.action_all = full_dataset.action_all
-    val_dataset.episode_ends = full_dataset.episode_ends
-    val_dataset.indices = np.array(val_indices, dtype=np.int64)
-    val_dataset.action_stats = action_stats
-    val_dataset.state_stats = state_stats
-    val_dataset.normalized_train_data = full_dataset.normalized_train_data
-    print(f"[Val] {len(val_dataset)} samples from {np.sum(val_mask)} episodes")
+    train_ds = PushTStateDataset.__new__(PushTStateDataset)
+    train_ds.config = config
+    train_ds.zarr_path = zarr_path
+    train_ds.state_all = state_all
+    train_ds.action_all = action_all
+    train_ds.episode_ends = episode_ends
+    train_ds.indices = np.array(train_indices, dtype=np.int64)
+    train_ds.action_stats = action_stats
+    train_ds.state_stats = state_stats
+    train_ds.normalized_train_data = normalized_data
 
-    return train_dataset, val_dataset
+    val_ds = PushTStateDataset.__new__(PushTStateDataset)
+    val_ds.config = config
+    val_ds.zarr_path = zarr_path
+    val_ds.state_all = state_all
+    val_ds.action_all = action_all
+    val_ds.episode_ends = episode_ends
+    val_ds.indices = np.array(val_indices, dtype=np.int64)
+    val_ds.action_stats = action_stats
+    val_ds.state_stats = state_stats
+    val_ds.normalized_train_data = normalized_data
+
+    print(f"[Train] {len(train_ds)} samples from {int(train_mask.sum())} episodes")
+    print(f"[Val]   {len(val_ds)} samples from {int(val_mask.sum())} episodes")
+
+    return train_ds, val_ds
 
 
 # ============================================================
