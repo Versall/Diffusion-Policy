@@ -23,6 +23,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
+import random
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -45,6 +46,17 @@ from models.noise_schedule import NoiseScheduleCosine
 # ============================================================
 # Konfigurasi Training
 # ============================================================
+
+def set_seed(seed: int, deterministic: bool = True):
+    """Set seed untuk reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 @dataclass
 class TrainConfig:
@@ -81,6 +93,8 @@ class TrainConfig:
     save_interval: int = 10
     output_dir: str = "checkpoints"
     run_name: str = "pusht_state_diffusion"
+
+
 
 
 # ============================================================
@@ -204,9 +218,9 @@ def load_checkpoint(
 # ============================================================
 
 def train(config: TrainConfig) -> ConditionalUnet1D:
+    set_seed(config.seed)
     device = torch.device(config.device)
-    print(f"[Train] Device: {device}")
-    print(f"[Train] Config: {config}")
+    print(f"[Train] Device: {device} | Seed: {config.seed}")
 
     # --- Dataset ---
     print("\n[Data] Loading dataset...")
