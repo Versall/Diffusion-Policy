@@ -1,0 +1,26 @@
+[project]
+name = "diffusion-policy-push-t"
+version = "0.1.0"
+description = "Diffusion Policy untuk task Push-T (state-based, CPU-only)"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "zarr>=2.14.0",
+    "gymnasium>=0.29.0",
+    "gym-pusht>=0.1.5",
+    "pygame>=2.5.0",
+    "matplotlib>=3.7.0",
+    "tqdm>=4.65.0",
+    "Pillow>=10.0.0",
+    "imageio>=2.31.0",
+    "imageio-ffmpeg>=0.4.9",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

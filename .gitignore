@@ -1,0 +1,90 @@
+# ============================================================
+# Diffusion Policy Push-T — .gitignore
+# ============================================================
+# Prinsip:
+#   - Kode & config: COMMIT
+#   - Dataset & checkpoint: JANGAN commit (transfer via SCP/cloud)
+#   - uv.lock: WAJIB commit (reproducibility)
+# ============================================================
+
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+
+# ============================================================
+# Virtual Environment
+# ============================================================
+.venv/
+venv/
+ENV/
+env/
+.conda/
+
+# CATATAN: uv.lock TIDAK di-ignore.
+#          Lockfile harus di-commit agar orang lain dapat versi sama.
+
+
+# ============================================================
+# Dataset (besar — transfer terpisah ke PC remote)
+# ============================================================
+data/pusht/*.zarr
+data/pusht/*.zip
+data/pusht/**/*.zarr
+data/pusht/**/*.zip
+data/manual_pusht/*.npz
+data/manual_pusht/**/*.npz
+data/**/*.zarr
+data/**/*.npz
+data/**/*.zip
+
+# Kecuali file .py di data/ (loader, script, dll.)
+!data/**/*.py
+
+
+# ============================================================
+# Checkpoint & Model Weights (besar — transfer terpisah)
+# ============================================================
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+
+# ============================================================
+# Output Visualisasi
+# ============================================================
+viz_output/
+outputs/
+*.gif
+*.mp4
+
+# Plot PNG/JPG — ignore by default, kecuali di docs/
+*.png
+*.jpg
+*.jpeg
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.jpeg
+
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
+logs/
+tensorboard/
+runs/
+
+
