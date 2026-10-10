@@ -1,7 +1,7 @@
 [project]
 name = "diffusion-policy-push-t"
 version = "0.1.0"
-description = "Diffusion Policy untuk task Push-T (state-based, CPU-only)"
+description = "Diffusion Policy untuk task Push-T (state-based, CUDA)"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch>=2.0.0",
@@ -17,10 +17,14 @@ dependencies = [
     "imageio-ffmpeg>=0.4.9",
 ]
 
+# ============================================================
+# CUDA index — pilih sesuai driver GPU di PC remote Anda
+# cu121 = CUDA 12.1, cu118 = CUDA 11.8
+# ============================================================
 [tool.uv.sources]
-torch = { index = "pytorch-cu121" }
+torch = { index = "pytorch-cuda" }
 
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu134"
 explicit = true

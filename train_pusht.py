@@ -71,8 +71,8 @@ class TrainConfig:
     noise_schedule_s: float = 0.008
 
     # Training
-    batch_size: int = 64
-    num_workers: int = 0
+    batch_size: int = 128
+    num_workers: int = 4
     lr: float = 1e-4
     weight_decay: float = 1e-4
     epochs: int = 50
