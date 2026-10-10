@@ -129,7 +129,7 @@ def main():
     parser.add_argument("--episodes", type=int, default=10, help="Number of episodes")
     parser.add_argument("--max-steps", type=int, default=1000, help="Max steps per episode")
     parser.add_argument("--inference-steps", type=int, default=10, help="DDIM inference steps")
-    parser.add_argument("--device", type=str, default="cpu", help="Device (cpu/cuda)")
+    parser.add_argument("--device", type=str, default="cuda", help="Device (cpu/cuda)")
     parser.add_argument("--render", action="store_true", help="Render env")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()

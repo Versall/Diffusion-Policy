@@ -268,7 +268,6 @@ def build_pusht_dataset(
         state_stats=state_stats,
     )
 
-
 def build_pusht_dataloader(
     dataset: PushTStateDataset,
     batch_size: int = 64,
@@ -279,14 +278,18 @@ def build_pusht_dataloader(
     """
     Buat DataLoader untuk training.
 
-    Args:
-        dataset: PushTStateDataset instance
-        batch_size: batch size
-        num_workers: num workers (0 = main process, >0 = multiprocessing)
-        shuffle: shuffle data
-        device: device target (untuk pin_memory)
+    CUDA-specific:
+        - pin_memory=True saat device CUDA → transfer CPU→GPU lebih cepat
+        - pin_memory_device=str(device) → alokasi pinned memory untuk GPU yang benar
+        - prefetch_factor=2 saat num_workers>0 → worker siapkan batch lebih awal
     """
-    pin_memory = device is not None and device.type == 'cuda'
+    pin_memory = device is not None and device.type == "cuda"
+
+    # PyTorch >= 2.0: spesifik device untuk pinned memory
+    pin_memory_device = str(device) if pin_memory else ""
+
+    # prefetch_factor hanya valid kalau num_workers > 0
+    prefetch_factor = 2 if num_workers > 0 else None
 
     return DataLoader(
         dataset,
@@ -294,8 +297,10 @@ def build_pusht_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        pin_memory_device=pin_memory_device,
         persistent_workers=(num_workers > 0),
-        drop_last=True,  # biar batch size konsisten
+        prefetch_factor=prefetch_factor,
+        drop_last=True,
     )
 
 

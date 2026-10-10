@@ -76,7 +76,7 @@ class TrainConfig:
     lr: float = 1e-4
     weight_decay: float = 1e-4
     epochs: int = 50
-    device: str = "cpu"
+    device: str = "cuda"
 
     # Logging / Checkpoint
     log_interval: int = 10
@@ -154,7 +154,7 @@ def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, config,
     print(f"[Checkpoint] Saved: {path}")
 
 
-def load_checkpoint(path, model, optimizer=None, device=torch.device('cpu')):
+def load_checkpoint(path, model, optimizer=None, device=torch.device('cuda')):
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt['model_state_dict'])
     if optimizer is not None and 'optimizer_state_dict' in ckpt:
@@ -324,7 +324,7 @@ def main():
         lr=1e-4,
         weight_decay=1e-4,
         epochs=50,
-        device="cpu",
+        device="cuda",
         log_interval=20,
         save_interval=10,
         output_dir="checkpoints",

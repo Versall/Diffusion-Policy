@@ -46,7 +46,7 @@ class DDIMSampler:
         model: ConditionalUnet1D,
         noise_sched: NoiseScheduleCosine,
         num_inference_steps: int = 10,
-        device: torch.device = torch.device("cpu"),
+        device: torch.device = torch.device("cuda"),
     ):
         self.model = model
         self.noise_sched = noise_sched
@@ -56,10 +56,10 @@ class DDIMSampler:
         self.timesteps = np.linspace(
             noise_sched.T, 1, num_inference_steps, dtype=int
         ).copy()
-        self.alpha_bar = noise_sched.alpha_bar[self.timesteps].cpu().numpy()
+        self.alpha_bar = noise_sched.alpha_bar[self.timesteps].cuda().numpy()
         self.alpha_bar_prev = np.concatenate([
             self.alpha_bar[1:],
-            noise_sched.alpha_bar[0:1].cpu().numpy(),
+            noise_sched.alpha_bar[0:1].cuda().numpy(),
         ])
 
     @torch.no_grad()
@@ -105,7 +105,7 @@ class DDIMSamplerWithHistory(DDIMSampler):
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         B = cond.shape[0]
         x = torch.randn(B, action_dim, pred_horizon, device=self.device)
-        x_history = [x.clone().cpu()]
+        x_history = [x.clone().cuda()]
         pred_x0_history = []
 
         for i, t in enumerate(self.timesteps):
@@ -116,7 +116,7 @@ class DDIMSamplerWithHistory(DDIMSampler):
             alpha_prev = self.alpha_bar_prev[i]
 
             pred_x0 = (x - np.sqrt(1 - alpha_t) * eps_pred) / np.sqrt(alpha_t)
-            pred_x0_history.append(pred_x0.clone().cpu())
+            pred_x0_history.append(pred_x0.clone().cuda())
 
             dir_xt = np.sqrt(1 - alpha_prev) * eps_pred
 
@@ -125,7 +125,7 @@ class DDIMSamplerWithHistory(DDIMSampler):
             else:
                 x = np.sqrt(alpha_prev) * pred_x0 + dir_xt
 
-            x_history.append(x.clone().cpu())
+            x_history.append(x.clone().cuda())
 
         final_actions = x.permute(0, 2, 1)
         return final_actions, x_history, pred_x0_history
@@ -147,7 +147,7 @@ class DiffusionPolicy:
     def __init__(
         self,
         ckpt_path: str,
-        device: str = "cpu",
+        device: str = "cuda",
         num_inference_steps: int = 10,
         use_history_sampler: bool = False,
     ):
@@ -279,7 +279,7 @@ class DiffusionPolicy:
         )
 
         action_chunk = unnormalize_data(
-            action_chunk_norm.cpu().numpy().reshape(-1, 2),
+            action_chunk_norm.cuda().numpy().reshape(-1, 2),
             self.action_stats,
         ).reshape(self.pred_horizon, 2)
 
@@ -301,13 +301,13 @@ class DiffusionPolicy:
             )
 
         final_actions = unnormalize_data(
-            final_actions_norm.cpu().numpy().reshape(-1, 2),
+            final_actions_norm.cuda().numpy().reshape(-1, 2),
             self.action_stats,
         ).reshape(self.pred_horizon, 2)
 
         x_history_denorm: List[np.ndarray] = []
         for x_h in x_history:
-            arr = x_h.permute(0, 2, 1).cpu().numpy().reshape(-1, 2)
+            arr = x_h.permute(0, 2, 1).cuda().numpy().reshape(-1, 2)
             arr = unnormalize_data(arr, self.action_stats).reshape(
                 1, self.pred_horizon, 2
             )
@@ -315,7 +315,7 @@ class DiffusionPolicy:
 
         pred_x0_history_denorm: List[np.ndarray] = []
         for px0_h in pred_x0_history:
-            arr = px0_h.permute(0, 2, 1).cpu().numpy().reshape(-1, 2)
+            arr = px0_h.permute(0, 2, 1).cuda().numpy().reshape(-1, 2)
             arr = unnormalize_data(arr, self.action_stats).reshape(
                 1, self.pred_horizon, 2
             )
@@ -326,7 +326,7 @@ class DiffusionPolicy:
             "x_history": x_history_denorm,
             "pred_x0_history": pred_x0_history_denorm,
             "timesteps": self.sampler.timesteps.copy(),
-            "cond": cond.cpu().numpy()[0],
+            "cond": cond.cuda().numpy()[0],
         }
 
 
@@ -335,7 +335,7 @@ class DiffusionPolicy:
 # ============================================================
 def load_policy(
     ckpt_path: str,
-    device: str = "cpu",
+    device: str = "cuda",
     num_inference_steps: int = 10,
     use_history_sampler: bool = False,
 ) -> DiffusionPolicy:
@@ -349,7 +349,7 @@ def load_policy(
 
 def load_policy_for_eval(
     ckpt_path: str,
-    device: str = "cpu",
+    device: str = "cuda",
     num_inference_steps: int = 10,
 ) -> DiffusionPolicy:
     return load_policy(
@@ -360,7 +360,7 @@ def load_policy_for_eval(
 
 def load_policy_for_visualization(
     ckpt_path: str,
-    device: str = "cpu",
+    device: str = "cuda",
     num_inference_steps: int = 20,
 ) -> DiffusionPolicy:
     return load_policy(

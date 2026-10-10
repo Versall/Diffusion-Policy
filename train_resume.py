@@ -31,7 +31,7 @@ from models.noise_schedule import NoiseScheduleCosine
 # Load Locked Config
 # ============================================================
 def load_locked_config(ckpt_path):
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location="cuda", weights_only=False)
     config_dict = ckpt["config"]
     model_state = ckpt["model_state_dict"]
     optimizer_state = ckpt["optimizer_state_dict"]
@@ -115,7 +115,7 @@ class TrainConfig:
     lr: float = 1e-4
     weight_decay: float = 1e-4
     epochs: int = 50
-    device: str = "cpu"
+    device: str = "cuda"
     log_interval: int = 10
     save_interval: int = 10
     output_dir: str = "checkpoints"
