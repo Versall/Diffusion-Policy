@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Diffusion Policy untuk task Push-T (state-based, CUDA)"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "torch>=2.0.0",
+    "torch>=2.7.0",          # ← Minimum untuk Blackwell sm_120
     "numpy>=1.24.0",
     "zarr>=2.14.0",
     "gymnasium>=0.29.0",
@@ -18,13 +18,12 @@ dependencies = [
 ]
 
 # ============================================================
-# CUDA index — pilih sesuai driver GPU di PC remote Anda
-# cu121 = CUDA 12.1, cu118 = CUDA 11.8
+# Index CUDA 12.8 — WAJIB untuk RTX 50-series (Blackwell)
 # ============================================================
 [tool.uv.sources]
 torch = { index = "pytorch-cuda" }
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/cu134"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
