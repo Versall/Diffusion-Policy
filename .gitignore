@@ -1,14 +1,4 @@
 # ============================================================
-# Diffusion Policy Push-T — .gitignore
-# ============================================================
-# Prinsip:
-#   - Kode & config: COMMIT
-#   - Dataset & checkpoint: JANGAN commit (transfer via SCP/cloud)
-#   - uv.lock: WAJIB commit (reproducibility)
-# ============================================================
-
-
-# ============================================================
 # Python
 # ============================================================
 __pycache__/
@@ -30,10 +20,6 @@ venv/
 ENV/
 env/
 .conda/
-
-# CATATAN: uv.lock TIDAK di-ignore.
-#          Lockfile harus di-commit agar orang lain dapat versi sama.
-
 
 # ============================================================
 # Dataset (besar — transfer terpisah ke PC remote)
