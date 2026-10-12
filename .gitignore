@@ -35,7 +35,7 @@ data/**/*.npz
 data/**/*.zip
 
 # Kecuali file .py di data/ (loader, script, dll.)
-!data/**/*.py
+# !data/**/*.py
 
 
 # ============================================================
