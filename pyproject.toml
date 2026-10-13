@@ -96,11 +96,24 @@ dev = [
 ]
 
 # ============================================================
+# Konfigurasi uv — HARUS DI ATAS sub-tabelnya
+# ============================================================
+[tool.uv]
+python-preference = "managed"
+
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cu118" },
+        { extra = "cu121" },
+        { extra = "cu128" },
+    ],
+]
+
+# ============================================================
 # uv sources: arahkan torch ke index yang sesuai
 # ============================================================
 [tool.uv.sources]
-# torch punya 4 varian — uv pilih berdasarkan extra yang aktif.
-# Setiap varian di-map ke index terpisah (semua `explicit = true`).
 torch = [
     { index = "pytorch-cpu",   extra = "cpu"   },
     { index = "pytorch-cu118", extra = "cu118" },
@@ -110,8 +123,6 @@ torch = [
 
 # ============================================================
 # uv index: definisi semua index PyTorch
-# `explicit = true` berarti index ini HANYA dipakai untuk paket
-# yang secara eksplisit di-map di [tool.uv.sources].
 # ============================================================
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -132,22 +143,6 @@ explicit = true
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
-
-# ============================================================
-# Konfigurasi uv
-# ============================================================
-[tool.uv]
-# Default: tidak ada extra — pakai index PyPI biasa.
-# Kalau ingin default CPU, uncomment:
-# default-groups = ["cpu"]
-# Atau di uv >= 0.5.3, aktifkan auto-detect backend:
-# torch-backend = "auto"
-
-# Pakai managed Python (uv unduh sendiri, tidak pakai sistem)
-python-preference = "managed"
-
-# Cache dir override (opsional):
-# cache-dir = "D:/uv-cache"
 
 # ============================================================
 # Konfigurasi pytest
@@ -200,3 +195,4 @@ exclude = '''
   | viz_output
 )/
 '''
+
