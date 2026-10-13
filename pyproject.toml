@@ -1,29 +1,202 @@
+# ============================================================
+# Diffusion Policy — Push-T
+# ============================================================
+# Device-agnostic: pilih CPU atau CUDA via extras.
+#
+# Cara pakai:
+#   CPU-only  : uv sync --extra cpu
+#   CUDA 11.8 : uv sync --extra cu118
+#   CUDA 12.1 : uv sync --extra cu121
+#   CUDA 12.8 : uv sync --extra cu128    ← untuk RTX 50-series (Blackwell)
+#   Auto      : uv sync --torch-backend=auto   (uv >= 0.5.3)
+#
+# CATATAN:
+# - Hanya SATU extra CUDA yang boleh diaktifkan sekaligus.
+# - `uv sync` tanpa `--extra` akan pakai default (lihat [tool.uv] di bawah).
+# - `uv.lock` WAJIB di-commit — jangan tambahkan ke .gitignore.
+# ============================================================
+
 [project]
 name = "diffusion-policy-push-t"
 version = "0.1.0"
-description = "Diffusion Policy untuk task Push-T (state-based, CUDA)"
+description = "Diffusion Policy untuk task Push-T (state-based, CPU/CUDA)"
+readme = "README.md"
 requires-python = ">=3.11,<3.13"
+authors = [
+    { name = "Amrah" },
+]
+license = { text = "MIT" }
+keywords = ["diffusion-policy", "reinforcement-learning", "robotics", "push-t"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# ============================================================
+# Dependencies (device-agnostic)
+# ============================================================
+# Jangan daftarkan torch di sini — di-define via extras di bawah.
 dependencies = [
-    "torch>=2.7.0",          # ← Minimum untuk Blackwell sm_120
+    # --- Core numerik ---
     "numpy>=1.24.0",
+
+    # --- Data ---
     "zarr>=2.14.0",
+
+    # --- Environment Push-T ---
     "gymnasium>=0.29.0",
     "gym-pusht>=0.1.5",
+    "pymunk>=6.6.0,<7.0.0",   # Pin <7.0.0: gym-pusht pakai API lama
     "pygame>=2.5.0",
+
+    # --- Visualisasi & logging ---
     "matplotlib>=3.7.0",
     "tqdm>=4.65.0",
     "Pillow>=10.0.0",
     "imageio>=2.31.0",
     "imageio-ffmpeg>=0.4.9",
+
+    # --- Utility ---
+    "huggingface_hub>=0.20.0",   # opsional: upload checkpoint ke HF Hub
 ]
 
 # ============================================================
-# Index CUDA 12.8 — WAJIB untuk RTX 50-series (Blackwell)
+# Extras: pilih device backend
+# ============================================================
+[project.optional-dependencies]
+# CPU-only (laptop/client tanpa GPU)
+cpu = [
+    "torch>=2.0.0",
+]
+
+# CUDA 11.8 (GPU lama: RTX 20/30-series, GTX 16-series)
+cu118 = [
+    "torch>=2.0.0",
+]
+
+# CUDA 12.1 (GPU mid: RTX 30/40-series)
+cu121 = [
+    "torch>=2.0.0",
+]
+
+# CUDA 12.8 (GPU baru: RTX 50-series / Blackwell)
+# WAJIB torch>=2.7.0 untuk kernel sm_120
+cu128 = [
+    "torch>=2.7.0",
+]
+
+# Development (test, lint, format)
+dev = [
+    "pytest>=7.4.0",
+    "ruff>=0.1.0",
+    "black>=24.0.0",
+]
+
+# ============================================================
+# uv sources: arahkan torch ke index yang sesuai
 # ============================================================
 [tool.uv.sources]
-torch = { index = "pytorch-cuda" }
+# torch punya 4 varian — uv pilih berdasarkan extra yang aktif.
+# Setiap varian di-map ke index terpisah (semua `explicit = true`).
+torch = [
+    { index = "pytorch-cpu",   extra = "cpu"   },
+    { index = "pytorch-cu118", extra = "cu118" },
+    { index = "pytorch-cu121", extra = "cu121" },
+    { index = "pytorch-cu128", extra = "cu128" },
+]
+
+# ============================================================
+# uv index: definisi semua index PyTorch
+# `explicit = true` berarti index ini HANYA dipakai untuk paket
+# yang secara eksplisit di-map di [tool.uv.sources].
+# ============================================================
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cuda"
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+# ============================================================
+# Konfigurasi uv
+# ============================================================
+[tool.uv]
+# Default: tidak ada extra — pakai index PyPI biasa.
+# Kalau ingin default CPU, uncomment:
+# default-groups = ["cpu"]
+# Atau di uv >= 0.5.3, aktifkan auto-detect backend:
+# torch-backend = "auto"
+
+# Pakai managed Python (uv unduh sendiri, tidak pakai sistem)
+python-preference = "managed"
+
+# Cache dir override (opsional):
+# cache-dir = "D:/uv-cache"
+
+# ============================================================
+# Konfigurasi pytest
+# ============================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short"
+
+# ============================================================
+# Konfigurasi ruff (linter)
+# ============================================================
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    ".venv",
+    "__pycache__",
+    "checkpoints",
+    "data",
+    "viz_output",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "W",   # pycodestyle warnings
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "E501",  # line too long (biarkan formatter handle)
+    "B008",  # do not perform function call in default arg
+]
+
+# ============================================================
+# Konfigurasi black (formatter)
+# ============================================================
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+exclude = '''
+/(
+    \.venv
+  | __pycache__
+  | checkpoints
+  | data
+  | viz_output
+)/
+'''

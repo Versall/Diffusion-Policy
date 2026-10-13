@@ -8,18 +8,33 @@ File ini berisi semua komponen untuk MENJALANKAN (inference) Diffusion Policy:
     3. DiffusionPolicy          — wrapper siap pakai di environment
     4. Factory functions        — load_policy, load_policy_for_eval, dll.
 
-K2 UPDATE:
-    - Conditioning sekarang memakai obs_horizon=2 frame (flatten).
-    - global_cond_dim = obs_horizon * state_dim = 2 * 5 = 10.
-    - Identik dengan pendekatan repo asli (real-stanford/diffusion_policy):
-        global_cond = obs_features.reshape(B, -1)
+Device-agnostic:
+    - Deteksi device otomatis via `utils.device.get_device()`.
+    - Default `device=None` → CUDA kalau tersedia, fallback ke CPU.
+    - Tidak ada `.cuda()` hardcoded. Semua tensor pakai `.to(self.device)`.
+
+K2 Fix (conditioning To=2):
+    - Conditioning memakai SELURUH obs_horizon frame (flatten).
+    - `global_cond_dim = obs_horizon * state_dim = 2 * 5 = 10`.
+
+Dipanggil oleh:
+    - eval_policy.py                    → load_policy_for_eval
+    - visualize_policy.py               → load_policy_for_eval
+    - visualize_diffusion_process.py    → load_policy_for_visualization + DDIMSamplerWithHistory
 """
 from __future__ import annotations
 
-import numpy as np
-import torch
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+import torch
+
+# Pastikan root repo ada di sys.path agar import utils bisa
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from utils.device import get_device, describe_device
 from models.mlp_noise_head import ConditionalUnet1D
 from models.noise_schedule import NoiseScheduleCosine
 from data.pusht_dataset import normalize_data, unnormalize_data
@@ -39,6 +54,11 @@ class DDIMSampler:
               b. Estimasi x_0 dari x_t dan ε.
               c. Hitung x_{t-1} dari x_0_estimasi dan ε.
         3. Hasil akhir = x_0 = action chunk.
+
+    Device-agnostic:
+        - `device=None` → auto-detect via get_device().
+        - Semua tensor internal di `self.device`.
+        - `alpha_bar` disimpan di CPU (hanya untuk operasi scalar).
     """
 
     def __init__(
@@ -46,20 +66,33 @@ class DDIMSampler:
         model: ConditionalUnet1D,
         noise_sched: NoiseScheduleCosine,
         num_inference_steps: int = 10,
-        device: torch.device = torch.device("cuda"),
+        device: Optional[torch.device] = None,
     ):
         self.model = model
         self.noise_sched = noise_sched
         self.num_inference_steps = num_inference_steps
+
+        # --- Device auto-detect ---
+        if device is None:
+            device = get_device()
         self.device = device
 
+        # --- Pre-compute timesteps inference ---
+        # t = T, T-step, T-2*step, ..., 1
         self.timesteps = np.linspace(
             noise_sched.T, 1, num_inference_steps, dtype=int
         ).copy()
-        self.alpha_bar = noise_sched.alpha_bar[self.timesteps].cuda().numpy()
+
+        # --- Ambil α_bar untuk timesteps tersebut ---
+        # FIX: pakai `.cpu()` bukan `.cuda()` — nilai scalar, tidak perlu GPU.
+        self.alpha_bar = noise_sched.alpha_bar[self.timesteps].cpu().numpy()
+
+        # --- α_bar_prev: α_bar di timestep berikutnya (turun) ---
+        # Contoh: timesteps=[100, 91, ..., 1]
+        # alpha_bar_prev = [α_bar[91], α_bar[82], ..., α_bar[0]=1.0]
         self.alpha_bar_prev = np.concatenate([
             self.alpha_bar[1:],
-            noise_sched.alpha_bar[0:1].cuda().numpy(),
+            noise_sched.alpha_bar[0:1].cpu().numpy(),
         ])
 
     @torch.no_grad()
@@ -69,7 +102,23 @@ class DDIMSampler:
         action_dim: int = 2,
         pred_horizon: int = 16,
     ) -> torch.Tensor:
+        """
+        Sample action chunk dari noise.
+
+        Args:
+            cond: (B, global_cond_dim) — state conditioning.
+            action_dim: dimensi action.
+            pred_horizon: panjang action chunk.
+
+        Returns:
+            (B, pred_horizon, action_dim) — action di ruang ternormalisasi.
+        """
         B = cond.shape[0]
+
+        # Pastikan cond di device yang benar
+        cond = cond.to(self.device)
+
+        # Mulai dari noise murni
         x = torch.randn(B, action_dim, pred_horizon, device=self.device)
 
         for i, t in enumerate(self.timesteps):
@@ -87,6 +136,7 @@ class DDIMSampler:
             else:
                 x = np.sqrt(alpha_prev) * pred_x0 + dir_xt
 
+        # (B, action_dim, pred_horizon) → (B, pred_horizon, action_dim)
         return x.permute(0, 2, 1)
 
 
@@ -94,7 +144,10 @@ class DDIMSampler:
 #  BAGIAN 2: DDIM SAMPLER DENGAN HISTORY
 # ============================================================
 class DDIMSamplerWithHistory(DDIMSampler):
-    """Varian yang menyimpan history untuk visualisasi denoising."""
+    """
+    Varian yang menyimpan history x_t dan pred_x0 di setiap langkah.
+    Untuk animasi visualisasi denoising.
+    """
 
     @torch.no_grad()
     def sample_with_history(
@@ -104,8 +157,10 @@ class DDIMSamplerWithHistory(DDIMSampler):
         pred_horizon: int = 16,
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         B = cond.shape[0]
+        cond = cond.to(self.device)
+
         x = torch.randn(B, action_dim, pred_horizon, device=self.device)
-        x_history = [x.clone().cuda()]
+        x_history = [x.clone().cpu()]
         pred_x0_history = []
 
         for i, t in enumerate(self.timesteps):
@@ -116,7 +171,7 @@ class DDIMSamplerWithHistory(DDIMSampler):
             alpha_prev = self.alpha_bar_prev[i]
 
             pred_x0 = (x - np.sqrt(1 - alpha_t) * eps_pred) / np.sqrt(alpha_t)
-            pred_x0_history.append(pred_x0.clone().cuda())
+            pred_x0_history.append(pred_x0.clone().cpu())
 
             dir_xt = np.sqrt(1 - alpha_prev) * eps_pred
 
@@ -125,7 +180,7 @@ class DDIMSamplerWithHistory(DDIMSampler):
             else:
                 x = np.sqrt(alpha_prev) * pred_x0 + dir_xt
 
-            x_history.append(x.clone().cuda())
+            x_history.append(x.clone().cpu())
 
         final_actions = x.permute(0, 2, 1)
         return final_actions, x_history, pred_x0_history
@@ -138,22 +193,30 @@ class DiffusionPolicy:
     """
     Wrapper policy — jembatan antara environment dan model Diffusion.
 
-    K2 UPDATE:
-        Conditioning sekarang memakai SELURUH obs_horizon frame (2 frame),
-        bukan hanya frame terakhir. Ini memberi model informasi temporal
-        (kecepatan agent & block) yang dibutuhkan untuk prediksi akurat.
+    Tanggung jawab:
+        1. Load checkpoint (.pt) — model, normalizer, config.
+        2. Bangun model & sampler dari config checkpoint.
+        3. Terima obs dari environment (numpy), normalisasi, jalankan sampler,
+           kembalikan action (numpy) yang sudah di-denormalisasi.
+
+    Device-agnostic:
+        - `device=None` → auto-detect.
+        - Model & sampler dipindah ke device yang terdeteksi.
+        - Checkpoint di-load dengan `map_location` yang aman.
     """
 
     def __init__(
         self,
         ckpt_path: str,
-        device: str = "cuda",
+        device: Optional[str] = None,
         num_inference_steps: int = 10,
         use_history_sampler: bool = False,
     ):
-        self.device = torch.device(device)
+        # --- Device auto-detect ---
+        self.device = get_device(prefer=device)
 
         # --- 1. Load checkpoint ---
+        # map_location otomatis — checkpoint dari GPU bisa di-load di CPU dan sebaliknya
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         config = ckpt["config"]
         action_stats = ckpt["action_stats"]
@@ -161,6 +224,7 @@ class DiffusionPolicy:
 
         print(f"[Policy] Loaded: {ckpt_path}")
         print(f"[Policy] Epoch: {ckpt['epoch']}, Val loss: {ckpt['val_loss']:.6f}")
+        print(f"[Policy] Device: {describe_device(self.device)}")
         print(
             f"[Policy] Config: pred_horizon={config['pred_horizon']}, "
             f"obs_horizon={config['obs_horizon']}, "
@@ -168,7 +232,7 @@ class DiffusionPolicy:
             f"global_cond_dim={config['global_cond_dim']}"
         )
 
-        # --- 2. Bangun model dari config ---
+        # --- 2. Bangun model ---
         self.model = ConditionalUnet1D(
             input_dim=config["input_dim"],
             global_cond_dim=config["global_cond_dim"],
@@ -245,16 +309,13 @@ class DiffusionPolicy:
         if len(self.obs_buffer) == 0:
             self._init_buffer(obs)
 
-        # Normalisasi obs baru → [-1, 1]
         obs_norm = normalize_data(
             obs.reshape(1, -1).astype(np.float32), self.state_stats
         ).squeeze(0)
 
-        # Shift buffer (buang paling lama, tambah baru)
         self.obs_buffer.pop(0)
         self.obs_buffer.append(obs_norm)
 
-        # Stack jadi (1, obs_horizon, 5), lalu flatten jadi (1, 10)
         cond = torch.from_numpy(
             np.stack(self.obs_buffer)
         ).unsqueeze(0).to(self.device)                # (1, 2, 5)
@@ -279,7 +340,7 @@ class DiffusionPolicy:
         )
 
         action_chunk = unnormalize_data(
-            action_chunk_norm.cuda().numpy().reshape(-1, 2),
+            action_chunk_norm.cpu().numpy().reshape(-1, 2),
             self.action_stats,
         ).reshape(self.pred_horizon, 2)
 
@@ -301,13 +362,13 @@ class DiffusionPolicy:
             )
 
         final_actions = unnormalize_data(
-            final_actions_norm.cuda().numpy().reshape(-1, 2),
+            final_actions_norm.cpu().numpy().reshape(-1, 2),
             self.action_stats,
         ).reshape(self.pred_horizon, 2)
 
         x_history_denorm: List[np.ndarray] = []
         for x_h in x_history:
-            arr = x_h.permute(0, 2, 1).cuda().numpy().reshape(-1, 2)
+            arr = x_h.permute(0, 2, 1).cpu().numpy().reshape(-1, 2)
             arr = unnormalize_data(arr, self.action_stats).reshape(
                 1, self.pred_horizon, 2
             )
@@ -315,7 +376,7 @@ class DiffusionPolicy:
 
         pred_x0_history_denorm: List[np.ndarray] = []
         for px0_h in pred_x0_history:
-            arr = px0_h.permute(0, 2, 1).cuda().numpy().reshape(-1, 2)
+            arr = px0_h.permute(0, 2, 1).cpu().numpy().reshape(-1, 2)
             arr = unnormalize_data(arr, self.action_stats).reshape(
                 1, self.pred_horizon, 2
             )
@@ -326,7 +387,7 @@ class DiffusionPolicy:
             "x_history": x_history_denorm,
             "pred_x0_history": pred_x0_history_denorm,
             "timesteps": self.sampler.timesteps.copy(),
-            "cond": cond.cuda().numpy()[0],
+            "cond": cond.cpu().numpy()[0],
         }
 
 
@@ -335,10 +396,19 @@ class DiffusionPolicy:
 # ============================================================
 def load_policy(
     ckpt_path: str,
-    device: str = "cuda",
+    device: Optional[str] = None,
     num_inference_steps: int = 10,
     use_history_sampler: bool = False,
 ) -> DiffusionPolicy:
+    """
+    Factory generik.
+
+    Args:
+        ckpt_path: path ke checkpoint .pt
+        device: "cpu", "cuda", atau None (auto-detect)
+        num_inference_steps: jumlah langkah DDIM
+        use_history_sampler: pakai DDIMSamplerWithHistory?
+    """
     return DiffusionPolicy(
         ckpt_path=ckpt_path,
         device=device,
@@ -349,9 +419,13 @@ def load_policy(
 
 def load_policy_for_eval(
     ckpt_path: str,
-    device: str = "cuda",
+    device: Optional[str] = None,
     num_inference_steps: int = 10,
 ) -> DiffusionPolicy:
+    """
+    Load policy untuk evaluasi (tanpa history — lebih hemat memori).
+    Dipakai oleh eval_policy.py dan visualize_policy.py.
+    """
     return load_policy(
         ckpt_path, device, num_inference_steps,
         use_history_sampler=False,
@@ -360,9 +434,13 @@ def load_policy_for_eval(
 
 def load_policy_for_visualization(
     ckpt_path: str,
-    device: str = "cuda",
+    device: Optional[str] = None,
     num_inference_steps: int = 20,
 ) -> DiffusionPolicy:
+    """
+    Load policy dengan history sampler (untuk animasi denoising).
+    Dipakai oleh visualize_diffusion_process.py.
+    """
     return load_policy(
         ckpt_path, device, num_inference_steps,
         use_history_sampler=True,
