@@ -1,23 +1,24 @@
-""" Training script untuk Diffusion Policy pada Push-T (state-based, low-dim).
+"""
+Training Diffusion Policy Push-T (keypoint + agent_pos, 20D).
 
-Integrasi:
-- Dataset: PushTStateDataset (data/pusht_dataset.py)
-- Model: ConditionalUnet1D (models/mlp_noise_head.py)
-- Noise Schedule: NoiseScheduleCosine (models/noise_schedule.py)
-- Device: auto-detect via utils/device.py (CUDA > MPS > CPU)
+Mengikuti gaya repo asli `real-stanford/diffusion_policy`:
+- TIDAK menggunakan validation set / val loss
+- Checkpoint periodik setiap `save_interval` epoch
+- Hanya track training loss (MSE noise prediction)
+- EMA (Exponential Moving Average) opsional untuk stabilisasi
+- Metrik sebenarnya = success rate, dihitung terpisah via eval_policy.py
 
-Referensi arsitektur:
-- real-stanford/diffusion_policy (conditional_unet1d.py, train_diffusion_unet_*.py)
-- qlOoOlp/Diffusion-Policy-Tutorial (pusht_trainer.py)
-
-Device-agnostic:
-- `config.device = None` → auto-detect.
-- Override via CLI: `--device cpu` atau `--device cuda`.
-- Override via env: `FORCE_DEVICE=cpu python train_pusht.py`.
+Training loss (DDPM ε-prediction):
+  Untuk tiap sampel di batch:
+    1. Sample t ~ Uniform(1, T)
+    2. Sample ε ~ N(0, I)
+    3. x_t = √(ᾱ_t)·x_0 + √(1-ᾱ_t)·ε
+    4. loss = MSE(ε_θ(x_t, t, cond), ε)
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import random
 import sys
@@ -31,29 +32,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-# Pastikan root repo di sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from utils.device import get_device, describe_device, is_cuda, summary
+from utils.device import get_device, describe_device, summary
 from data.pusht_dataset import (
-    PushTStateDataset,
     PushTDataConfig,
-    build_pusht_dataset,
-    build_pusht_dataloader,
     split_train_val_dataset,
+    build_pusht_dataloader,
 )
 from models.mlp_noise_head import ConditionalUnet1D
 from models.noise_schedule import NoiseScheduleCosine
 
 
 # ============================================================
-# Reproducibility
+# Reproducibility (K3)
 # ============================================================
 def set_seed(seed: int, deterministic: bool = True):
-    """Set seed untuk reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -70,16 +66,18 @@ def set_seed(seed: int, deterministic: bool = True):
 @dataclass
 class TrainConfig:
     # Dataset
-    zarr_path: str
+    zarr_path: str = "data/pusht/pusht_cchi_v7_replay.zarr"
     pred_horizon: int = 16
     obs_horizon: int = 2
     action_horizon: int = 8
-    val_ratio: float = 0.1
     seed: int = 42
 
-    # Model
+    # Dimensi (keypoint + agent_pos)
+    obs_dim: int = 20
     input_dim: int = 2
-    global_cond_dim: int = 10          # K2: obs_horizon * state_dim = 2 * 5
+    global_cond_dim: int = 40     # obs_horizon × obs_dim = 2 × 20
+
+    # Model
     diffusion_step_embed_dim: int = 256
     down_dims: Tuple[int, ...] = (256, 512, 1024)
     kernel_size: int = 3
@@ -95,183 +93,163 @@ class TrainConfig:
     lr: float = 1e-4
     weight_decay: float = 1e-4
     epochs: int = 50
+    grad_clip: float = 1.0
 
-    # Device: None = auto-detect (CUDA > MPS > CPU)
-    # Bisa juga "cpu", "cuda", "cuda:0", dsb.
+    # EMA (opsional, seperti repo asli)
+    use_ema: bool = True
+    ema_decay: float = 0.999
+
+    # Device
     device: Optional[str] = None
 
     # Logging / Checkpoint
-    log_interval: int = 10
-    save_interval: int = 10
+    log_interval: int = 20
+    save_interval: int = 10        # simpan tiap N epoch
     output_dir: str = "checkpoints"
     run_name: str = "pusht_state_diffusion"
 
 
 # ============================================================
-# Loss Function: MSE noise prediction
+# EMA Helper (mengikuti repo asli)
+# ============================================================
+class EMAModel:
+    """Exponential Moving Average dari model parameters."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {
+            k: v.detach().clone()
+            for k, v in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
+            else:
+                self.shadow[k].copy_(v)
+
+    def state_dict(self) -> Dict:
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(self, d: Dict):
+        self.decay = d["decay"]
+        self.shadow = d["shadow"]
+
+    def copy_to(self, model: nn.Module):
+        model.load_state_dict(self.shadow, strict=True)
+
+
+# ============================================================
+# Diffusion Loss
 # ============================================================
 def diffusion_loss(
     model: ConditionalUnet1D,
     noise_sched: NoiseScheduleCosine,
-    x_0: torch.Tensor,
-    cond: torch.Tensor,
+    x_0: torch.Tensor,          # (B, Ta, Da) normalized
+    cond: torch.Tensor,         # (B, global_cond_dim)
     device: torch.device,
 ) -> torch.Tensor:
-    """
-    Diffusion training loss (MSE antara noise prediksi vs noise asli).
-
-    Algorithm:
-    1. Sample timestep t ~ Uniform(1, T)
-    2. Sample noise eps ~ N(0, I)
-    3. x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * eps
-    4. eps_pred = model(x_t, t, cond)
-    5. Loss = MSE(eps_pred, eps)
-    """
     B = x_0.shape[0]
     T = noise_sched.T
 
-    # Sample timestep
+    # 1. Sample timestep acak
     t = torch.randint(1, T + 1, (B,), device=device, dtype=torch.long)
 
-    # Sample noise
+    # 2. Sample noise
     noise = torch.randn_like(x_0)
 
-    # Forward diffusion: q_sample
+    # 3. Forward diffusion
     x_t = noise_sched.q_sample(x_0, t, noise)
 
-    # Model prediction
-    x_t_permuted = x_t.permute(0, 2, 1)  # (B, action_dim, T_a)
-    eps_pred = model(x_t_permuted, t, cond)
-    loss = F.mse_loss(eps_pred.permute(0, 2, 1), noise)
+    # 4. Prediksi noise
+    eps_pred = model(x_t.permute(0, 2, 1), t, cond)
 
-    return loss
-
-
-# ============================================================
-# Validation Loss
-# ============================================================
-@torch.no_grad()
-def evaluate(
-    model: ConditionalUnet1D,
-    noise_sched: NoiseScheduleCosine,
-    val_loader: DataLoader,
-    device: torch.device,
-) -> float:
-    """Hitung rata-rata validation loss."""
-    model.eval()
-    total_loss = 0.0
-    total_samples = 0
-
-    for batch in val_loader:
-        x_0 = batch["action"].to(device)
-        # K2 FIX: flatten obs_horizon × state_dim
-        cond = batch["state"].reshape(batch["state"].shape[0], -1).to(device)
-        loss = diffusion_loss(model, noise_sched, x_0, cond, device)
-        total_loss += loss.item() * x_0.size(0)
-        total_samples += x_0.size(0)
-
-    model.train()
-    return total_loss / total_samples if total_samples > 0 else float("inf")
+    # 5. MSE loss
+    return F.mse_loss(eps_pred.permute(0, 2, 1), noise)
 
 
 # ============================================================
-# Checkpoint Utilities
+# Checkpoint
 # ============================================================
 def save_checkpoint(
     model: ConditionalUnet1D,
     optimizer: optim.Optimizer,
+    ema: Optional[EMAModel],
     epoch: int,
     train_loss: float,
-    val_loss: float,
     config: TrainConfig,
-    action_stats: Dict,
-    state_stats: Dict,
+    normalizer_state: Optional[Dict],
     path: Path,
-    device: Optional[torch.device] = None,
 ):
-    """
-    Simpan checkpoint lengkap.
-
-    Catatan: model state selalu disimpan di CPU agar kompatibel
-    di-load di device apa pun (CPU/CUDA/MPS).
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Pindah state_dict ke CPU untuk portabilitas
     model_state = {k: v.cpu() for k, v in model.state_dict().items()}
-
-    # Optimizer state juga — tapi ini kompleks, biarkan di device asli
-    opt_state = optimizer.state_dict()
-
-    torch.save({
+    ckpt = {
         "epoch": epoch,
         "model_state_dict": model_state,
-        "optimizer_state_dict": opt_state,
+        "optimizer_state_dict": optimizer.state_dict(),
         "train_loss": train_loss,
-        "val_loss": val_loss,
         "config": config.__dict__,
-        "action_stats": action_stats,
-        "state_stats": state_stats,
-    }, path)
+        "normalizer_state": normalizer_state,
+    }
+    if ema is not None:
+        # EMA shadow juga disimpan di CPU
+        ema_state = {
+            "decay": ema.decay,
+            "shadow": {k: v.cpu() for k, v in ema.shadow.items()},
+        }
+        ckpt["ema_state"] = ema_state
+    torch.save(ckpt, path)
     print(f"[Checkpoint] Saved: {path}")
 
 
-def load_checkpoint(
-    path: Path,
-    model: ConditionalUnet1D,
-    optimizer: Optional[optim.Optimizer] = None,
-    device: Optional[torch.device] = None,
-) -> Dict:
-    """
-    Load checkpoint.
-
-    `map_location` otomatis ke device target, jadi checkpoint yang
-    disimpan dari GPU bisa di-load di CPU (dan sebaliknya).
-    """
-    if device is None:
-        device = get_device()
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    if optimizer is not None and "optimizer_state_dict" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    print(f"[Checkpoint] Loaded: {path} (epoch {ckpt.get('epoch', '?')})")
-    return ckpt
-
-
 # ============================================================
-# Main Training Loop
+# Training Loop
 # ============================================================
 def train(config: TrainConfig) -> ConditionalUnet1D:
-    # --- Seed ---
     set_seed(config.seed)
-
-    # --- Device auto-detect ---
     device = get_device(prefer=config.device)
     print(summary())
     print(f"[Train] Device: {describe_device(device)} | Seed: {config.seed}")
     print(f"[Train] Config: {config}")
 
-    # --- Dataset ---
-    print("\n[Data] Loading dataset...")
-    train_ds, val_ds = split_train_val_dataset(
-        zarr_path=config.zarr_path,
-        val_ratio=config.val_ratio,
-        seed=config.seed,
-        pred_horizon=config.pred_horizon,
+    # --- Dataset (train only, no val) ---
+    print("\n[Data] Loading dataset (keypoint + agent_pos, 20D)...")
+    data_cfg = PushTDataConfig(
+        dataset_path=config.zarr_path,
         obs_horizon=config.obs_horizon,
-        action_horizon=config.action_horizon,
+        pred_horizon=config.pred_horizon,
+        obs_dim=config.obs_dim,
+        action_dim=config.input_dim,
+        val_ratio=0.0,           # tidak pakai val
+        seed=config.seed,
     )
+    # Pakai seluruh dataset sebagai train
+    train_ds, _ = split_train_val_dataset(data_cfg)
+    # Kembalikan val_ratio=0.0 agar val_idx kosong
+    # (fallback: kalau split menghasilkan val tidak kosong, abaikan saja)
+    print(f"[Data] Train samples: {len(train_ds)}")
+
+    sample = train_ds[0]
+    assert sample["obs"].shape == (config.obs_horizon, config.obs_dim)
+    assert sample["action"].shape == (config.pred_horizon, config.input_dim)
+
+    pin = (device.type == "cuda")
     train_loader = build_pusht_dataloader(
-        train_ds, batch_size=config.batch_size,
-        num_workers=config.num_workers, device=device,
+        train_ds,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=pin,
+        drop_last=True,
     )
-    val_loader = build_pusht_dataloader(
-        val_ds, batch_size=config.batch_size,
-        num_workers=config.num_workers, device=device,
-    )
-    action_stats, state_stats = train_ds.get_normalization_stats()
-    print(f"[Data] Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
     print(f"[Data] Batches/epoch: {len(train_loader)}")
+
+    normalizer_state = (
+        train_ds.normalizer.state_dict()
+        if train_ds.normalizer is not None else None
+    )
 
     # --- Model ---
     print("\n[Model] Building ConditionalUnet1D...")
@@ -283,10 +261,15 @@ def train(config: TrainConfig) -> ConditionalUnet1D:
         kernel_size=config.kernel_size,
         n_groups=config.n_groups,
     ).to(device)
+
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[Model] Total params: {total_params:,}, Trainable: {trainable_params:,}")
-    print(f"[Model] global_cond_dim: {config.global_cond_dim}")
+    print(f"[Model] Params: {total_params:,}")
+    print(f"[Model] global_cond_dim = {config.global_cond_dim}")
+
+    # --- EMA ---
+    ema = EMAModel(model, decay=config.ema_decay) if config.use_ema else None
+    if ema is not None:
+        print(f"[EMA] Enabled, decay={config.ema_decay}")
 
     # --- Noise Schedule ---
     noise_sched = NoiseScheduleCosine(
@@ -295,29 +278,27 @@ def train(config: TrainConfig) -> ConditionalUnet1D:
         device=device,
     )
 
-    # --- Optimizer ---
+    # --- Optimizer + Scheduler ---
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config.lr,
         weight_decay=config.weight_decay,
     )
-
-    # --- LR Scheduler ---
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=config.epochs,
         eta_min=config.lr * 0.01,
     )
 
-    # --- Output dir ---
+    # --- Output ---
     output_dir = Path(config.output_dir) / config.run_name
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Output] Checkpoints -> {output_dir}")
 
-    # --- Training Loop ---
-    print(f"\n[Train] Starting training for {config.epochs} epochs...")
-    best_val_loss = float("inf")
-    history = {"train_loss": [], "val_loss": [], "lr": []}
+    # --- Loop ---
+    print(f"\n[Train] Starting {config.epochs} epochs (no validation)...")
+    history = {"train_loss": [], "lr": []}
+    global_step = 0
 
     for epoch in range(1, config.epochs + 1):
         epoch_start = time.time()
@@ -327,66 +308,81 @@ def train(config: TrainConfig) -> ConditionalUnet1D:
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs}", leave=False)
         for batch in pbar:
-            x_0 = batch["action"].to(device)
-            # K2 FIX: flatten obs_horizon × state_dim
-            cond = batch["state"].reshape(batch["state"].shape[0], -1).to(device)
+            x_0 = batch["action"].to(device, non_blocking=True)
+            cond = batch["obs"].reshape(batch["obs"].shape[0], -1).to(device, non_blocking=True)
 
             loss = diffusion_loss(model, noise_sched, x_0, cond, device)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if config.grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
+
+            # Update EMA setiap step (seperti repo asli)
+            if ema is not None:
+                ema.update(model)
 
             epoch_loss += loss.item()
             num_batches += 1
+            global_step += 1
 
             if num_batches % config.log_interval == 0:
                 pbar.set_postfix({"loss": f"{loss.item():.6f}"})
 
-        avg_train_loss = epoch_loss / num_batches
-        history["train_loss"].append(avg_train_loss)
-
-        # Validation
-        val_loss = evaluate(model, noise_sched, val_loader, device)
-        history["val_loss"].append(val_loss)
-
-        # LR step
+        avg_train_loss = epoch_loss / max(num_batches, 1)
         current_lr = scheduler.get_last_lr()[0]
         scheduler.step()
+
+        history["train_loss"].append(avg_train_loss)
         history["lr"].append(current_lr)
 
         epoch_time = time.time() - epoch_start
-        print(f"Epoch {epoch:3d}/{config.epochs} | "
-              f"Train: {avg_train_loss:.6f} | Val: {val_loss:.6f} | "
-              f"LR: {current_lr:.2e} | Time: {epoch_time:.1f}s")
+        print(
+            f"Epoch {epoch:3d}/{config.epochs} | "
+            f"train_loss: {avg_train_loss:.6f} | "
+            f"LR: {current_lr:.2e} | "
+            f"time: {epoch_time:.1f}s"
+        )
 
-        # Save checkpoint
-        if epoch % config.save_interval == 0 or val_loss < best_val_loss:
-            ckpt_path = output_dir / f"epoch_{epoch:04d}_train_{avg_train_loss:.4f}_val_{val_loss:.4f}.pt"
+        # --- Checkpoint periodik (gaya repo asli) ---
+        if epoch % config.save_interval == 0:
+            # Simpan model reguler
+            ckpt_path = output_dir / f"epoch_{epoch:04d}.pt"
             save_checkpoint(
-                model, optimizer, epoch, avg_train_loss, val_loss, config,
-                action_stats, state_stats, ckpt_path, device=device,
+                model, optimizer, ema, epoch, avg_train_loss,
+                config, normalizer_state, ckpt_path,
             )
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_path = output_dir / "best.pt"
+            # Simpan versi EMA terpisah (biasanya lebih stabil)
+            if ema is not None:
+                ema_model = copy.deepcopy(model)
+                ema.copy_to(ema_model)
+                ema_path = output_dir / f"epoch_{epoch:04d}_ema.pt"
                 save_checkpoint(
-                    model, optimizer, epoch, avg_train_loss, val_loss, config,
-                    action_stats, state_stats, best_path, device=device,
+                    ema_model, optimizer, None, epoch, avg_train_loss,
+                    config, normalizer_state, ema_path,
                 )
 
-    # Save final
+        # Simpan last.pt setiap epoch (untuk resume)
+        save_checkpoint(
+            model, optimizer, ema, epoch, avg_train_loss,
+            config, normalizer_state, output_dir / "last.pt",
+        )
+
+    # --- Simpan final ---
     final_path = output_dir / "final.pt"
     save_checkpoint(
-        model, optimizer, config.epochs, history["train_loss"][-1],
-        history["val_loss"][-1], config, action_stats, state_stats,
-        final_path, device=device,
+        model, optimizer, ema, config.epochs, history["train_loss"][-1],
+        config, normalizer_state, final_path,
     )
 
-    print(f"\n[Train] Done! Best val loss: {best_val_loss:.6f}")
-    print(f"[Train] Checkpoints saved to: {output_dir}")
+    print(f"\n[Train] Done!")
+    print(f"[Train] Final train loss: {history['train_loss'][-1]:.6f}")
+    print(f"[Train] Checkpoints: {output_dir}")
+    print(f"[Train] Untuk evaluasi success rate:")
+    print(f"        uv run python eval_policy.py --ckpt {output_dir / 'epoch_{:04d}.pt'.format(config.epochs)} --episodes 50")
+
     return model
 
 
@@ -394,40 +390,32 @@ def train(config: TrainConfig) -> ConditionalUnet1D:
 # Entry Point
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="Train Diffusion Policy on Push-T")
-    parser.add_argument(
-        "--device", type=str, default=None,
-        help="Device: 'cpu', 'cuda', 'cuda:0', atau None (auto-detect).",
-    )
+    parser = argparse.ArgumentParser(description="Train DP Push-T (keypoint 20D)")
+    parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument(
-        "--zarr", type=str, default=None,
-        help="Path ke dataset .zarr. Default: <repo>/data/pusht/pusht_cchi_v7_replay.zarr",
-    )
+    parser.add_argument("--zarr", type=str, default=None)
+    parser.add_argument("--no-ema", action="store_true")
+    parser.add_argument("--save-interval", type=int, default=10)
     args = parser.parse_args()
 
-    # Resolve path dataset
     if args.zarr:
         zarr_path = Path(args.zarr).resolve()
     else:
-        repo_root = Path(__file__).resolve().parent
-        zarr_path = repo_root / "data" / "pusht" / "pusht_cchi_v7_replay.zarr"
+        zarr_path = Path(__file__).resolve().parent / "data" / "pusht" / "pusht_cchi_v7_replay.zarr"
 
     if not zarr_path.exists():
         print(f"[Error] Dataset not found: {zarr_path}")
-        print("Jalankan: uv run python data/get_data.py")
         sys.exit(1)
 
-    # Susun config
     config = TrainConfig(
         zarr_path=str(zarr_path),
         pred_horizon=16,
         obs_horizon=2,
         action_horizon=8,
-        val_ratio=0.1,
         seed=args.seed,
+        obs_dim=20,
         input_dim=2,
         global_cond_dim=40,
         diffusion_step_embed_dim=256,
@@ -441,9 +429,12 @@ def main():
         lr=1e-4,
         weight_decay=1e-4,
         epochs=args.epochs,
-        device=args.device,           # None = auto
+        grad_clip=1.0,
+        use_ema=not args.no_ema,
+        ema_decay=0.999,
+        device=args.device,
         log_interval=20,
-        save_interval=10,
+        save_interval=args.save_interval,
         output_dir="checkpoints",
         run_name="pusht_state_diffusion",
     )
