@@ -429,7 +429,7 @@ def main():
         val_ratio=0.1,
         seed=args.seed,
         input_dim=2,
-        global_cond_dim=10,
+        global_cond_dim=40,
         diffusion_step_embed_dim=256,
         down_dims=(256, 512, 1024),
         kernel_size=3,
