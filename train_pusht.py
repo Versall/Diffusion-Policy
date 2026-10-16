@@ -93,7 +93,7 @@ class TrainConfig:
     lr: float = 1e-4
     weight_decay: float = 1e-4
     epochs: int = 50
-    grad_clip: float = 1.0
+    grad_clip: float = 0.0
 
     # EMA (opsional, seperti repo asli)
     use_ema: bool = True
