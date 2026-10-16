@@ -135,15 +135,38 @@ class LockedTrainConfig:
     run_name: str = "pusht_state_diffusion_locked"
     device: Optional[str] = None
 
-    @classmethod
-    def from_checkpoint(cls, config_dict: Dict, **overrides) -> "LockedTrainConfig":
-        """Factory dari checkpoint config dict."""
-        if isinstance(config_dict.get("down_dims"), list):
-            config_dict = {**config_dict, "down_dims": tuple(config_dict["down_dims"])}
-        # Buang field device lama kalau ada
-        config_dict.pop("device", None)
-        merged = {**config_dict, **overrides}
-        return cls(**merged)
+@classmethod
+def from_checkpoint(cls, config_dict: Dict, **overrides) -> "LockedTrainConfig":
+    """
+    Factory dari checkpoint config dict.
+
+    Menyaring field yang tidak dikenal agar kompatibel dengan
+    checkpoint lama (dari train_pusht.py) yang menyimpan config
+    TrainConfig lengkap.
+    """
+    if isinstance(config_dict.get("down_dims"), list):
+        config_dict = {
+            **config_dict,
+            "down_dims": tuple(config_dict["down_dims"]),
+        }
+
+    # Field yang tidak boleh masuk LockedTrainConfig
+    EXCLUDE = {
+        "device",                   # auto-detect
+        "epochs",                   # pakai resume_epochs
+        "run_name",                 # di-override
+        "finetune_lr_scale",        # mutable (ada di TrainConfig)
+        "scheduler_eta_min_scale",  # mutable (ada di TrainConfig)
+        "action_stats",             # di-pass via overrides
+        "state_stats",              # di-pass via overrides
+    }
+
+    filtered = {
+        k: v for k, v in config_dict.items() if k not in EXCLUDE
+    }
+
+    merged = {**filtered, **overrides}
+    return cls(**merged)
 
     def to_train_config(self) -> "TrainConfig":
         """Convert ke TrainConfig mutable untuk training loop."""

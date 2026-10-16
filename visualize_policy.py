@@ -197,7 +197,7 @@ def main():
     )
     parser.add_argument(
         "--ckpt", type=str,
-        default="checkpoints/pusht_state_diffusion/best.pt",
+        default="checkpoints/pusht_state_diffusion/final.pt",
         help="Path ke checkpoint.",
     )
     parser.add_argument("--episodes", type=int, default=3,
