@@ -1,484 +1,373 @@
 """
-Push-T Dataset Loader untuk Diffusion Policy.
+Dataset Push-T low-dimensional untuk Diffusion Policy.
 
-Dataset: pusht_cchi_v7_replay.zarr (state-based, low-dim)
-Struktur data:
-  - data/state: (N, 5) = [agent_x, agent_y, block_x, block_y, block_angle]
-  - data/action: (N, 2) = [target_x, target_y]
-  - meta/episode_ends: (E,) indeks akhir tiap episode
+Representasi observasi: keypoint + agent_pos
+- keypoint: (N, 9, 2) → flatten → (N, 18)
+- agent_pos: state[:, :2] → (N, 2)
+- obs: (N, 20)
 
-Referensi arsitektur:
-  - real-stanford/diffusion_policy (pusht_image_dataset.py, replay_buffer.py, sampler.py)
-  - qlOoOlp/Diffusion-Policy-Tutorial (pusht_dataset.py, utils.py, pusht_builder.py)
+Referensi repo asli:
+https://github.com/real-stanford/diffusion_policy/blob/main/diffusion_policy/dataset/pusht_dataset.py
+
+Output __getitem__:
+- 'obs':    (obs_horizon, 20)
+- 'action': (pred_horizon, 2)
 """
 
 from __future__ import annotations
-import os
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
-import zarr
 from torch.utils.data import Dataset, DataLoader
 
-
-# ============================================================
-# Utilitas Sampling & Normalisasi (adaptasi dari tutorial)
-# ============================================================
-
-def create_sample_indices(
-    episode_ends: np.ndarray,
-    sequence_length: int,
-    pad_before: int = 0,
-    pad_after: int = 0,
-) -> np.ndarray:
-    """
-    Buat indeks sliding-window per episode dengan padding.
-
-    Args:
-        episode_ends: shape (E,) - indeks akhir tiap episode (exclusive)
-        sequence_length: panjang sequence prediksi (pred_horizon)
-        pad_before: padding di awal (obs_horizon - 1)
-        pad_after: padding di akhir (action_horizon - 1)
-
-    Returns:
-        indices: shape (num_samples, 4) = [buffer_start, buffer_end, sample_start, sample_end]
-    """
-    indices = []
-    for i in range(len(episode_ends)):
-        start_idx = 0 if i == 0 else episode_ends[i - 1]
-        end_idx = episode_ends[i]
-        episode_length = end_idx - start_idx
-
-        min_start = -pad_before
-        max_start = episode_length - sequence_length + pad_after
-
-        for idx in range(min_start, max_start + 1):
-            buffer_start_idx = max(idx, 0) + start_idx
-            buffer_end_idx = min(idx + sequence_length, episode_length) + start_idx
-            start_offset = buffer_start_idx - (idx + start_idx)
-            end_offset = (idx + sequence_length + start_idx) - buffer_end_idx
-            sample_start_idx = 0 + start_offset
-            sample_end_idx = sequence_length - end_offset
-            indices.append([
-                buffer_start_idx, buffer_end_idx,
-                sample_start_idx, sample_end_idx
-            ])
-    return np.array(indices, dtype=np.int64)
+try:
+    import zarr
+except ImportError as e:
+    raise ImportError(
+        "Butuh `zarr` untuk memuat dataset Push-T. "
+        "Install dengan: uv add zarr"
+    ) from e
 
 
-def sample_sequence(
-    train_data: Dict[str, np.ndarray],
-    sequence_length: int,
-    buffer_start_idx: int,
-    buffer_end_idx: int,
-    sample_start_idx: int,
-    sample_end_idx: int,
-) -> Dict[str, np.ndarray]:
-    """
-    Ekstrak sequence dari buffer dengan padding edge-replication.
-    """
-    result = {}
-    for key, input_arr in train_data.items():
-        sample = input_arr[buffer_start_idx:buffer_end_idx]
-        if (sample_start_idx > 0) or (sample_end_idx < sequence_length):
-            data = np.zeros(
-                shape=(sequence_length,) + input_arr.shape[1:],
-                dtype=input_arr.dtype
-            )
-            if sample_start_idx > 0:
-                data[:sample_start_idx] = sample[0]
-            if sample_end_idx < sequence_length:
-                data[sample_end_idx:] = sample[-1]
-            data[sample_start_idx:sample_end_idx] = sample
-        else:
-            data = sample
-        result[key] = data
-    return result
-
-
-def get_data_stats(data: np.ndarray) -> Dict[str, np.ndarray]:
-    """Hitung statistik min/max per dimensi untuk normalisasi [0,1] -> [-1,1]."""
-    data = data.reshape(-1, data.shape[-1])
-    return {
-        'min': np.min(data, axis=0),
-        'max': np.max(data, axis=0),
-    }
-
-
-def normalize_data(data: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
-    """Normalisasi ke [-1, 1]."""
-    ndata = (data - stats['min']) / (stats['max'] - stats['min'] + 1e-8)
-    return ndata * 2 - 1
-
-
-def unnormalize_data(ndata: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
-    """Denormalisasi dari [-1, 1] ke skala asli."""
-    ndata = (ndata + 1) / 2
-    return ndata * (stats['max'] - stats['min'] + 1e-8) + stats['min']
-
-
-# ============================================================
-# Dataset Class
-# ============================================================
+# =========================================================
+# Konfigurasi
+# =========================================================
 
 @dataclass
 class PushTDataConfig:
     """Konfigurasi dataset Push-T."""
-    pred_horizon: int = 16      # panjang chunk action yang diprediksi (T_a)
-    obs_horizon: int = 2        # jumlah step observasi kondisi (T_o)
-    action_horizon: int = 8     # jumlah action yang dieksekusi per step inference
-    # Catatan: di training, pred_horizon = sequence_length
-    # obs_horizon digunakan untuk menentukan pad_before
-    # action_horizon digunakan untuk pad_after (biasanya action_horizon-1)
+    dataset_path: str = "data/pusht/pusht_cchi_v7_replay.zarr"
+
+    # Horizon
+    obs_horizon: int = 2      # To
+    pred_horizon: int = 16    # Ta
+
+    # Dimensi
+    obs_dim: int = 20         # 18 keypoint + 2 agent_pos
+    action_dim: int = 2
+
+    # Normalisasi
+    normalize: bool = True
+    norm_mode: str = "min_max"   # "min_max" atau "identity"
+
+    # Split
+    val_ratio: float = 0.1
+    seed: int = 42
 
 
-class PushTStateDataset(Dataset):
+# =========================================================
+# Normalizer
+# =========================================================
+
+class LinearNormalizer:
     """
-    Dataset Push-T state-based (low-dim) untuk Diffusion Policy.
-
-    Output __getitem__:
-        dict dengan keys:
-        - 'state': (obs_horizon, 5) - observasi state kondisi (normalized)
-        - 'action': (pred_horizon, 2) - target action chunk (normalized)
-
-    Catatan: state[..., :2] = agent position, state[..., 2:] = block pose
+    Normalizer linear (min_max atau identity) untuk vektor.
+    Stats dihitung dari train only (fix K1: no data leakage).
     """
+
+    def __init__(self, mode: str = "min_max", eps: float = 1e-6):
+        assert mode in ("min_max", "identity"), f"Mode tidak dikenal: {mode}"
+        self.mode = mode
+        self.eps = eps
+        self.stats = {}
+
+    def fit(self, data: np.ndarray, key: str):
+        """
+        Hitung stats dari data train.
+        data: (N, D)
+        """
+        if self.mode == "identity":
+            self.stats[key] = {
+                "min": np.zeros(data.shape[-1], dtype=np.float32),
+                "max": np.ones(data.shape[-1], dtype=np.float32),
+            }
+            return
+
+        d_min = data.min(axis=0).astype(np.float32)
+        d_max = data.max(axis=0).astype(np.float32)
+        self.stats[key] = {"min": d_min, "max": d_max}
+
+    def normalize(self, data: np.ndarray, key: str) -> np.ndarray:
+        """Skala ke [-1, 1] (min_max) atau lewatkan apa adanya (identity)."""
+        if not self.stats:
+            raise RuntimeError("Normalizer belum di-fit.")
+        s = self.stats[key]
+        d_min, d_max = s["min"], s["max"]
+        rng = np.maximum(d_max - d_min, self.eps)
+        # Map [min, max] -> [-1, 1]
+        out = 2.0 * (data - d_min) / rng - 1.0
+        return out.astype(np.float32)
+
+    def unnormalize(self, data: np.ndarray, key: str) -> np.ndarray:
+        """Inverse dari normalize."""
+        s = self.stats[key]
+        d_min, d_max = s["min"], s["max"]
+        rng = np.maximum(d_max - d_min, self.eps)
+        out = (data + 1.0) * 0.5 * rng + d_min
+        return out.astype(np.float32)
+
+    def state_dict(self) -> dict:
+        return {"mode": self.mode, "eps": self.eps, "stats": self.stats}
+
+    def load_state_dict(self, d: dict):
+        self.mode = d["mode"]
+        self.eps = d["eps"]
+        self.stats = d["stats"]
+
+
+# =========================================================
+# Dataset
+# =========================================================
+
+class PushTDataset(Dataset):
+    """
+    Dataset Push-T low-dim.
+
+    Representasi obs:
+        keypoint (9, 2) → flatten (18,)
+        agent_pos (2,)  → posisi agen dari state[:, :2]
+        concat          → (20,)
+
+    Karena obs_horizon > 1, obs dari beberapa frame berturut-turut
+    akan di-stack menjadi (obs_horizon, 20) saat __getitem__.
+    """
+
     def __init__(
         self,
-        zarr_path: str,
-        config: Optional[PushTDataConfig] = None,
-        # normalisasi stats (jika None, dihitung dari data)
-        action_stats: Optional[Dict[str, np.ndarray]] = None,
-        state_stats: Optional[Dict[str, np.ndarray]] = None,
+        dataset_path: str,
+        obs_horizon: int = 2,
+        pred_horizon: int = 16,
+        normalize: bool = True,
+        norm_mode: str = "min_max",
+        normalizer: Optional[LinearNormalizer] = None,
+        indices: Optional[np.ndarray] = None,
     ):
-        self.config = config or PushTDataConfig()
-        self.zarr_path = zarr_path
+        super().__init__()
+        self.dataset_path = dataset_path
+        self.obs_horizon = obs_horizon
+        self.pred_horizon = pred_horizon
+        self.normalize = normalize
+        self.norm_mode = norm_mode
 
-        # --- load zarr (zarr v3 API) ---
-        dataset_root = zarr.open(store=zarr_path, mode='r')
+        # ---------------------------------------------
+        # Load zarr
+        # ---------------------------------------------
+        root = zarr.open(dataset_path, mode="r")
+        data = root["data"]
 
-        # data mentah
-        self.state_all = dataset_root['data']['state'][:]      # (N, 5)
-        self.action_all = dataset_root['data']['action'][:]    # (N, 2)
-        self.episode_ends = dataset_root['meta']['episode_ends'][:]
+        state_all    = data["state"][:]      # (N, 5)
+        keypoint_all = data["keypoint"][:]   # (N, 9, 2)
+        action_all   = data["action"][:]     # (N, 2)
 
-        # --- buat sample indices ---
-        # pad_before = obs_horizon - 1 (kondisi state dari step sebelumnya)
-        # pad_after = action_horizon - 1 (action yang dieksekusi setelah prediksi)
-        self.indices = create_sample_indices(
-            episode_ends=self.episode_ends,
-            sequence_length=self.config.pred_horizon,
-            pad_before=self.config.obs_horizon - 1,
-            pad_after=self.config.action_horizon - 1,
+        N = state_all.shape[0]
+
+        # ---------------------------------------------
+        # Bentuk obs: keypoint (flatten) + agent_pos
+        # ---------------------------------------------
+        # keypoint: (N, 9, 2) → (N, 18)
+        keypoint_flat = keypoint_all.reshape(N, -1).astype(np.float32)
+
+        # agent_pos: state[:, :2] → (N, 2)
+        agent_pos = state_all[:, :2].astype(np.float32)
+
+        # concat → (N, 20)
+        obs_all = np.concatenate([keypoint_flat, agent_pos], axis=-1)
+
+        self.obs_all    = obs_all            # (N, 20)
+        self.action_all = action_all.astype(np.float32)  # (N, 2)
+        self.N = N
+
+        # ---------------------------------------------
+        # Normalizer
+        # ---------------------------------------------
+        if self.normalize:
+            if normalizer is not None:
+                # Pakai normalizer yang sudah di-fit (untuk val/test)
+                self.normalizer = normalizer
+            else:
+                # Fit dari train only (indices sudah dipilih)
+                self.normalizer = LinearNormalizer(mode=norm_mode)
+                if indices is not None:
+                    train_obs = obs_all[indices]
+                    train_act = self.action_all[indices]
+                else:
+                    train_obs = obs_all
+                    train_act = self.action_all
+                self.normalizer.fit(train_obs, "obs")
+                self.normalizer.fit(train_act, "action")
+        else:
+            self.normalizer = None
+
+        # ---------------------------------------------
+        # Index valid untuk sliding window
+        # ---------------------------------------------
+        # Frame awal harus menyisakan obs_horizon + pred_horizon
+        # obs: [i, i+obs_horizon)
+        # action: [i+obs_horizon-1, i+obs_horizon-1+pred_horizon)
+        self.valid_start = np.arange(
+            0, N - obs_horizon - pred_horizon + 1, dtype=np.int64
         )
 
-        # --- normalisasi ---
-        # state: gunakan 5D penuh (agent_pos + block_pose)
-        # action: 2D (target position)
-        train_data = {
-            'state': self.state_all.astype(np.float32),
-            'action': self.action_all.astype(np.float32),
-        }
-
-        if action_stats is None:
-            action_stats = get_data_stats(train_data['action'])
-        if state_stats is None:
-            state_stats = get_data_stats(train_data['state'])
-
-        self.action_stats = action_stats
-        self.state_stats = state_stats
-
-        normalized_train_data = {
-            'state': normalize_data(train_data['state'], state_stats).astype(np.float32),
-            'action': normalize_data(train_data['action'], action_stats).astype(np.float32),
-        }
-
-        self.normalized_train_data = normalized_train_data
-
-        print(f"[PushTStateDataset] Loaded {len(self.action_all)} steps, "
-              f"{len(self.episode_ends)} episodes, "
-              f"{len(self.indices)} samples")
-        print(f"  pred_horizon={self.config.pred_horizon}, "
-              f"obs_horizon={self.config.obs_horizon}, "
-              f"action_horizon={self.config.action_horizon}")
-        print(f"  action_stats: min={action_stats['min']}, max={action_stats['max']}")
-        print(f"  state_stats:  min={state_stats['min']}, max={state_stats['max']}")
+        if indices is not None:
+            # Batasi ke subset (train/val) berdasarkan frame awal
+            self.valid_start = np.intersect1d(self.valid_start, indices)
 
     def __len__(self) -> int:
-        return len(self.indices)
+        return len(self.valid_start)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = self.indices[idx]
+    def __getitem__(self, idx: int) -> dict:
+        start = self.valid_start[idx]
 
-        nsample = sample_sequence(
-            train_data=self.normalized_train_data,
-            sequence_length=self.config.pred_horizon,
-            buffer_start_idx=buffer_start_idx,
-            buffer_end_idx=buffer_end_idx,
-            sample_start_idx=sample_start_idx,
-            sample_end_idx=sample_end_idx,
+        # obs: (obs_horizon, 20)
+        obs_seq = self.obs_all[start : start + self.obs_horizon]
+
+        # action: (pred_horizon, 2)
+        # action dimulai dari frame terakhir obs (start + obs_horizon - 1)
+        act_start = start + self.obs_horizon - 1
+        act_seq = self.action_all[act_start : act_start + self.pred_horizon]
+
+        # Normalisasi
+        if self.normalize and self.normalizer is not None:
+            obs_seq = self.normalizer.normalize(obs_seq, "obs")
+            act_seq = self.normalizer.normalize(act_seq, "action")
+
+        return {
+            "obs":    torch.from_numpy(obs_seq).float(),   # (obs_horizon, 20)
+            "action": torch.from_numpy(act_seq).float(),   # (pred_horizon, 2)
+        }
+
+
+# =========================================================
+# Builder
+# =========================================================
+
+def build_pusht_dataset(cfg: PushTDataConfig) -> PushTDataset:
+    """Bangun dataset tunggal (tanpa split)."""
+    return PushTDataset(
+        dataset_path=cfg.dataset_path,
+        obs_horizon=cfg.obs_horizon,
+        pred_horizon=cfg.pred_horizon,
+        normalize=cfg.normalize,
+        norm_mode=cfg.norm_mode,
+    )
+
+
+def split_train_val_dataset(
+    cfg: PushTDataConfig,
+) -> Tuple[PushTDataset, PushTDataset]:
+    """
+    Split train/val pada level frame (bukan window) agar tidak overlap.
+
+    Stats normalisasi di-fit dari train only (fix K1).
+    """
+    root = zarr.open(cfg.dataset_path, mode="r")
+    N = root["data"]["state"].shape[0]
+
+    rng = np.random.default_rng(cfg.seed)
+    perm = rng.permutation(N)
+
+    n_val = int(N * cfg.val_ratio)
+    val_idx = np.sort(perm[:n_val])
+    train_idx = np.sort(perm[n_val:])
+
+    # Fit normalizer dari train only
+    normalizer = None
+    if cfg.normalize:
+        # Ambil obs_all & action_all tanpa lewat dataset dulu
+        state_all    = root["data"]["state"][:]
+        keypoint_all = root["data"]["keypoint"][:]
+        action_all   = root["data"]["action"][:]
+
+        keypoint_flat = keypoint_all.reshape(N, -1).astype(np.float32)
+        agent_pos = state_all[:, :2].astype(np.float32)
+        obs_all = np.concatenate([keypoint_flat, agent_pos], axis=-1)
+
+        normalizer = LinearNormalizer(mode=cfg.norm_mode)
+        normalizer.fit(obs_all[train_idx], "obs")
+        normalizer.fit(action_all[train_idx].astype(np.float32), "action")
+
+        print(
+            f"[split] Train frames: {len(train_idx)} ({len(train_idx)/N:.1%}) | "
+            f"Val frames: {len(val_idx)} ({len(val_idx)/N:.1%})"
         )
 
-        # Hanya ambil obs_horizon pertama untuk state (kondisi)
-        # action: full pred_horizon sebagai target
-        result = {
-            'state': torch.from_numpy(nsample['state'][:self.config.obs_horizon]),  # (T_o, 5)
-            'action': torch.from_numpy(nsample['action']),                          # (T_a, 2)
-        }
-        return result
-
-    def get_normalization_stats(self) -> Tuple[Dict, Dict]:
-        """Return (action_stats, state_stats) untuk denormalisasi saat inferensi."""
-        return self.action_stats, self.state_stats
-
-
-# ============================================================
-# Builder Functions
-# ============================================================
-
-def build_pusht_dataset(
-    zarr_path: str,
-    pred_horizon: int = 16,
-    obs_horizon: int = 2,
-    action_horizon: int = 8,
-    action_stats: Optional[Dict[str, np.ndarray]] = None,
-    state_stats: Optional[Dict[str, np.ndarray]] = None,
-) -> PushTStateDataset:
-    """
-    Factory function untuk membuat PushTStateDataset.
-
-    Args:
-        zarr_path: path ke file .zarr (mis. data/pusht/pusht_cchi_v7_replay.zarr)
-        pred_horizon: panjang action chunk yang diprediksi
-        obs_horizon: jumlah step observasi sebagai kondisi
-        action_horizon: jumlah action dieksekusi per inference step
-        action_stats, state_stats: opsional, untuk shared stats (mis. val set pakai stats train)
-    """
-    config = PushTDataConfig(
-        pred_horizon=pred_horizon,
-        obs_horizon=obs_horizon,
-        action_horizon=action_horizon,
+    train_ds = PushTDataset(
+        dataset_path=cfg.dataset_path,
+        obs_horizon=cfg.obs_horizon,
+        pred_horizon=cfg.pred_horizon,
+        normalize=cfg.normalize,
+        norm_mode=cfg.norm_mode,
+        normalizer=normalizer,
+        indices=train_idx,
     )
-    return PushTStateDataset(
-        zarr_path=zarr_path,
-        config=config,
-        action_stats=action_stats,
-        state_stats=state_stats,
+
+    val_ds = PushTDataset(
+        dataset_path=cfg.dataset_path,
+        obs_horizon=cfg.obs_horizon,
+        pred_horizon=cfg.pred_horizon,
+        normalize=cfg.normalize,
+        norm_mode=cfg.norm_mode,
+        normalizer=normalizer,   # pakai stats train
+        indices=val_idx,
     )
+
+    return train_ds, val_ds
+
 
 def build_pusht_dataloader(
-    dataset: PushTStateDataset,
+    dataset: PushTDataset,
     batch_size: int = 64,
-    num_workers: int = 0,
     shuffle: bool = True,
-    device: Optional[torch.device] = None,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    drop_last: bool = False,
 ) -> DataLoader:
-    """
-    Buat DataLoader untuk training.
-
-    CUDA-specific:
-        - pin_memory=True saat device CUDA → transfer CPU→GPU lebih cepat
-        - pin_memory_device=str(device) → alokasi pinned memory untuk GPU yang benar
-        - prefetch_factor=2 saat num_workers>0 → worker siapkan batch lebih awal
-    """
-    pin_memory = device is not None and device.type == "cuda"
-
-    # PyTorch >= 2.0: spesifik device untuk pinned memory
-    pin_memory_device = str(device) if pin_memory else ""
-
-    # prefetch_factor hanya valid kalau num_workers > 0
-    prefetch_factor = 2 if num_workers > 0 else None
-
+    """Bungkus dataset ke DataLoader."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        pin_memory_device=pin_memory_device,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=prefetch_factor,
-        drop_last=True,
+        drop_last=drop_last,
     )
 
 
-# ============================================================
-# Validation Split Helper
-# ============================================================
-
-def split_train_val_dataset(
-    zarr_path: str,
-    val_ratio: float = 0.1,
-    seed: int = 42,
-    pred_horizon: int = 16,
-    obs_horizon: int = 2,
-    action_horizon: int = 8,
-) -> Tuple[PushTStateDataset, PushTStateDataset]:
-    """
-    Split dataset jadi train/val berdasarkan episode (bukan frame).
-    
-    FIX data leakage:
-    - Normalisasi stats (min/max) dihitung HANYA dari episode TRAIN.
-    - Stats train dipakai untuk normalize train DAN val.
-    - Val set tidak pernah "melihat" statistiknya sendiri.
-    """
-    # ============================================================
-    # 1. Load raw data + episode boundaries
-    # ============================================================
-    dataset_root = zarr.open(store=zarr_path, mode='r')
-    episode_ends = dataset_root['meta']['episode_ends'][:]
-    state_all = dataset_root['data']['state'][:].astype(np.float32)
-    action_all = dataset_root['data']['action'][:].astype(np.float32)
-    n_episodes = len(episode_ends)
-
-    # ============================================================
-    # 2. Split episode jadi train/val
-    # ============================================================
-    n_val = max(1, int(n_episodes * val_ratio))
-    rng = np.random.default_rng(seed=seed)
-    val_episode_idxs = rng.choice(n_episodes, size=n_val, replace=False)
-    val_mask = np.zeros(n_episodes, dtype=bool)
-    val_mask[val_episode_idxs] = True
-    train_mask = ~val_mask
-
-    # ============================================================
-    # 3. Kumpulkan frame dari episode TRAIN saja (untuk stats)
-    # ============================================================
-    train_frame_mask = np.zeros(len(state_all), dtype=bool)
-    for i in range(n_episodes):
-        if not val_mask[i]:
-            start_idx = 0 if i == 0 else episode_ends[i - 1]
-            end_idx = episode_ends[i]
-            train_frame_mask[start_idx:end_idx] = True
-
-    train_state = state_all[train_frame_mask]
-    train_action = action_all[train_frame_mask]
-
-    # ============================================================
-    # 4. Hitung stats HANYA dari frame TRAIN
-    # ============================================================
-    action_stats = get_data_stats(train_action)
-    state_stats = get_data_stats(train_state)
-
-    print(f"[Normalization] Stats computed from TRAIN ONLY "
-          f"({int(train_frame_mask.sum())}/{len(state_all)} frames)")
-    print(f"  action_stats: min={action_stats['min']}, max={action_stats['max']}")
-    print(f"  state_stats:  min={state_stats['min']},  max={state_stats['max']}")
-
-    # ============================================================
-    # 5. Normalize SEMUA frame pakai stats train-only
-    #    (val frames dinormalisasi dengan stats train — benar)
-    # ============================================================
-    normalized_data = {
-        'state': normalize_data(state_all, state_stats).astype(np.float32),
-        'action': normalize_data(action_all, action_stats).astype(np.float32),
-    }
-
-    # ============================================================
-    # 6. Build indices train & val
-    # ============================================================
-    train_indices = []
-    val_indices = []
-
-    for i in range(n_episodes):
-        start_idx = 0 if i == 0 else episode_ends[i - 1]
-        end_idx = episode_ends[i]
-        episode_length = end_idx - start_idx
-
-        min_start = -(obs_horizon - 1)
-        max_start = episode_length - pred_horizon + (action_horizon - 1)
-
-        for idx in range(min_start, max_start + 1):
-            buffer_start_idx = max(idx, 0) + start_idx
-            buffer_end_idx = min(idx + pred_horizon, episode_length) + start_idx
-            start_offset = buffer_start_idx - (idx + start_idx)
-            end_offset = (idx + pred_horizon + start_idx) - buffer_end_idx
-            sample_start_idx = 0 + start_offset
-            sample_end_idx = pred_horizon - end_offset
-
-            sample_info = [buffer_start_idx, buffer_end_idx,
-                           sample_start_idx, sample_end_idx]
-
-            if val_mask[i]:
-                val_indices.append(sample_info)
-            else:
-                train_indices.append(sample_info)
-
-    # ============================================================
-    # 7. Build datasets (pakai __new__ agar tidak recompute stats)
-    # ============================================================
-    config = PushTDataConfig(pred_horizon, obs_horizon, action_horizon)
-
-    train_ds = PushTStateDataset.__new__(PushTStateDataset)
-    train_ds.config = config
-    train_ds.zarr_path = zarr_path
-    train_ds.state_all = state_all
-    train_ds.action_all = action_all
-    train_ds.episode_ends = episode_ends
-    train_ds.indices = np.array(train_indices, dtype=np.int64)
-    train_ds.action_stats = action_stats
-    train_ds.state_stats = state_stats
-    train_ds.normalized_train_data = normalized_data
-
-    val_ds = PushTStateDataset.__new__(PushTStateDataset)
-    val_ds.config = config
-    val_ds.zarr_path = zarr_path
-    val_ds.state_all = state_all
-    val_ds.action_all = action_all
-    val_ds.episode_ends = episode_ends
-    val_ds.indices = np.array(val_indices, dtype=np.int64)
-    val_ds.action_stats = action_stats
-    val_ds.state_stats = state_stats
-    val_ds.normalized_train_data = normalized_data
-
-    print(f"[Train] {len(train_ds)} samples from {int(train_mask.sum())} episodes")
-    print(f"[Val]   {len(val_ds)} samples from {int(val_mask.sum())} episodes")
-
-    return train_ds, val_ds
-
-
-# ============================================================
-# Quick Test
-# ============================================================
+# =========================================================
+# Quick sanity check
+# =========================================================
 
 if __name__ == "__main__":
-    # Path dataset
-    REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ZARR_PATH = os.path.join(REPO_ROOT, "data", "pusht", "pusht_cchi_v7_replay.zarr")
-
-    if not os.path.exists(ZARR_PATH):
-        print(f"Dataset not found at {ZARR_PATH}")
-        print("Run: python data/get_data.py  (download & unzip)")
-        exit(1)
+    cfg = PushTDataConfig()
 
     print("=" * 60)
-    print("TEST PushTStateDataset")
+    print("Sanity check PushTDataset (keypoint + agent_pos, 20D)")
     print("=" * 60)
 
-    # Test basic dataset
-    dataset = build_pusht_dataset(ZARR_PATH, pred_horizon=16, obs_horizon=2, action_horizon=8)
-    print(f"\nDataset length: {len(dataset)}")
-    sample = dataset[0]
-    print(f"Sample keys: {sample.keys()}")
-    print(f"  state shape: {sample['state'].shape}")   # (2, 5)
-    print(f"  action shape: {sample['action'].shape}") # (16, 2)
-    print(f"  state[0]: {sample['state'][0]}")
-    print(f"  action[0]: {sample['action'][0]}")
+    train_ds, val_ds = split_train_val_dataset(cfg)
+    print(f"Train windows: {len(train_ds)}")
+    print(f"Val windows:   {len(val_ds)}")
 
-    # Test dataloader
-    print("\n--- DataLoader test ---")
-    dl = build_pusht_dataloader(dataset, batch_size=4, num_workers=0)
-    batch = next(iter(dl))
-    print(f"Batch state: {batch['state'].shape}")   # (4, 2, 5)
-    print(f"Batch action: {batch['action'].shape}") # (4, 16, 2)
+    sample = train_ds[0]
+    obs, act = sample["obs"], sample["action"]
+    print(f"obs shape:    {tuple(obs.shape)}   (harusnya (2, 20))")
+    print(f"action shape: {tuple(act.shape)}   (harusnya (16, 2))")
+    print(f"obs range:    [{obs.min():.3f}, {obs.max():.3f}]")
+    print(f"action range: [{act.min():.3f}, {act.max():.3f}]")
 
-    # Test train/val split
-    print("\n--- Train/Val Split test ---")
-    train_ds, val_ds = split_train_val_dataset(ZARR_PATH, val_ratio=0.1)
-    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
-    print(f"Train sample 0 state: {train_ds[0]['state'].shape}")
-    print(f"Val sample 0 state: {val_ds[0]['state'].shape}")
+    assert obs.shape == (cfg.obs_horizon, 20), \
+        f"obs shape salah: {obs.shape}"
+    assert act.shape == (cfg.pred_horizon, 2), \
+        f"action shape salah: {act.shape}"
 
-    print("\n=== All tests passed ===")
+    # Cek normalizer stats
+    if train_ds.normalizer is not None:
+        s = train_ds.normalizer.stats["obs"]
+        print(f"obs stats min: {s['min'][:3]} ...")
+        print(f"obs stats max: {s['max'][:3]} ...")
+
+    print("\n[OK] Sanity check passed.")    
