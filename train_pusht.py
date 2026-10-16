@@ -182,38 +182,48 @@ def diffusion_loss(
 # Checkpoint Save / Load
 # ============================================================
 def save_checkpoint(
-    model: nn.Module,
+    model: ConditionalUnet1D,
     optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler._LRScheduler,
     ema: Optional[EMAModel],
     epoch: int,
-    global_step: int,
     train_loss: float,
-    config: TrainConfig,
+    config,
     normalizer_state: Optional[Dict],
     path: Path,
 ):
+    """
+    Simpan checkpoint (gaya repo asli).
+
+    - `config` bisa dataclass (TrainConfig) atau dict (dari resume)
+    - `ema` opsional; kalau ada, shadow disimpan sebagai 'ema_state'
+    - Model state selalu di CPU untuk portabilitas
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+
     model_state = {k: v.cpu() for k, v in model.state_dict().items()}
+
+    # Handle dataclass ATAU dict
+    config_dict = config.__dict__ if hasattr(config, "__dict__") else config
 
     ckpt = {
         "epoch": epoch,
-        "global_step": global_step,
         "model_state_dict": model_state,
         "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "train_loss": train_loss,
-        "config": asdict(config),
+        "config": config_dict,
         "normalizer_state": normalizer_state,
     }
+
     if ema is not None:
-        ckpt["ema_state"] = {
+        ema_state = {
             "decay": ema.decay,
             "shadow": {k: v.cpu() for k, v in ema.shadow.items()},
         }
+        ckpt["ema_state"] = ema_state
+
     torch.save(ckpt, path)
     print(f"[Checkpoint] Saved: {path}")
-
+    
 
 def load_checkpoint(
     path: Path,
