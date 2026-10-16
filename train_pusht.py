@@ -7,6 +7,7 @@ Fitur:
 - EMA
 - Checkpoint periodik + last + final
 - Support config file YAML/JSON (--config)
+- Mixed precision (--amp) dengan API torch.amp (PyTorch 2.x)
 
 Contoh:
     # Training default
@@ -33,9 +34,9 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -106,7 +107,6 @@ class TrainConfig:
     grad_clip: float = 0.0
     optimizer: str = "adamw"           # "adamw" | "adam" | "sgd"
     scheduler: str = "cosine"           # "cosine" | "constant" | "step"
-    warmup_epochs: int = 0
     eta_min_ratio: float = 0.01
 
     # --- EMA ---
@@ -115,7 +115,7 @@ class TrainConfig:
 
     # --- Device ---
     device: Optional[str] = None
-    amp: bool = False                   # automatic mixed precision
+    amp: bool = False
 
     # --- Logging / Checkpoint ---
     log_interval: int = 20
@@ -253,7 +253,9 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> optim.Optimizer:
     if name == "adam":
         return optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     if name == "sgd":
-        return optim.SGD(model.parameters(), lr=config.lr, momentum=0.9, weight_decay=config.weight_decay)
+        return optim.SGD(
+            model.parameters(), lr=config.lr, momentum=0.9, weight_decay=config.weight_decay
+        )
     raise ValueError(f"Optimizer tidak dikenal: {config.optimizer}")
 
 
@@ -263,12 +265,47 @@ def build_scheduler(
     name = config.scheduler.lower()
     eta_min = config.lr * config.eta_min_ratio
     if name == "cosine":
-        return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=eta_min)
+        return optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.epochs, eta_min=eta_min
+        )
     if name == "constant":
-        return optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=config.epochs)
+        return optim.lr_scheduler.ConstantLR(
+            optimizer, factor=1.0, total_iters=config.epochs
+        )
     if name == "step":
-        return optim.lr_scheduler.StepLR(optimizer, step_size=max(1, config.epochs // 5), gamma=0.5)
+        return optim.lr_scheduler.StepLR(
+            optimizer, step_size=max(1, config.epochs // 5), gamma=0.5
+        )
     raise ValueError(f"Scheduler tidak dikenal: {config.scheduler}")
+
+
+# ============================================================
+# Normalizer State Helper
+# ============================================================
+def _extract_normalizer_state(dataset) -> Optional[Dict]:
+    """
+    Ambil state dict dari dataset.normalizer, mendukung:
+      - dict {'obs': LinearNormalizer, 'action': LinearNormalizer, ...}
+      - objek tunggal LinearNormalizer
+      - None
+    """
+    normalizer = getattr(dataset, "normalizer", None)
+    if normalizer is None:
+        return None
+
+    # Kasus 1: dict of LinearNormalizer
+    if isinstance(normalizer, dict):
+        out = {}
+        for k, v in normalizer.items():
+            out[k] = v.state_dict() if hasattr(v, "state_dict") else v
+        return out
+
+    # Kasus 2: objek tunggal dengan state_dict()
+    if hasattr(normalizer, "state_dict"):
+        return normalizer.state_dict()
+
+    # Kasus 3: sudah berupa dict biasa
+    return normalizer
 
 
 # ============================================================
@@ -311,10 +348,7 @@ def train(config: TrainConfig) -> ConditionalUnet1D:
     print(f"[Data] Batches/epoch: {len(train_loader)}")
 
     base_ds = train_ds.dataset if hasattr(train_ds, "dataset") else train_ds
-    normalizer_state = (
-        {k: v.state_dict() for k, v in base_ds.normalizer.items()}
-        if getattr(base_ds, "normalizer", None) is not None else None
-    )
+    normalizer_state = _extract_normalizer_state(base_ds)
 
     # --- Model ---
     print("\n[Model] Building ConditionalUnet1D...")
@@ -345,19 +379,19 @@ def train(config: TrainConfig) -> ConditionalUnet1D:
     optimizer = build_optimizer(model, config)
     scheduler = build_scheduler(optimizer, config)
     print(f"[Optim] {config.optimizer} | lr={config.lr} | wd={config.weight_decay}")
-    print(f"[Sched] {config.scheduler} | warmup={config.warmup_epochs}")
+    print(f"[Sched] {config.scheduler} | eta_min_ratio={config.eta_min_ratio}")
 
-    # --- AMP ---
-    scaler = torch.cuda.amp.GradScaler(enabled=config.amp and device.type == "cuda")
+    # --- AMP (API baru PyTorch 2.x) ---
+    use_amp = config.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     if config.amp:
-        print(f"[AMP] Enabled (device={device.type})")
+        print(f"[AMP] Enabled={use_amp} (device={device.type})")
 
     # --- Output ---
     output_dir = Path(config.output_dir) / config.run_name
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Output] Checkpoints -> {output_dir}")
 
-    # Simpan config ke JSON agar reproducible
     with open(output_dir / "config.json", "w") as f:
         json.dump(asdict(config), f, indent=2)
 
@@ -399,10 +433,11 @@ def train(config: TrainConfig) -> ConditionalUnet1D:
             x_0 = batch["action"].to(device, non_blocking=True)
             cond = batch["obs"].reshape(batch["obs"].shape[0], -1).to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=config.amp and device.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 loss = diffusion_loss(model, noise_sched, x_0, cond, device)
 
             optimizer.zero_grad(set_to_none=True)
+
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 if config.grad_clip > 0:
@@ -550,7 +585,6 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--grad-clip", type=float, default=None)
     g.add_argument("--optimizer", type=str, choices=["adamw", "adam", "sgd"], default=None)
     g.add_argument("--scheduler", type=str, choices=["cosine", "constant", "step"], default=None)
-    g.add_argument("--warmup-epochs", type=int, default=None)
     g.add_argument("--eta-min-ratio", type=float, default=None)
 
     # EMA
@@ -608,7 +642,6 @@ def main():
             if not hasattr(config, k):
                 print(f"[Warn] Config file key tidak dikenal: {k}")
                 continue
-            # Konversi list → tuple untuk down_dims
             if k == "down_dims" and isinstance(v, list):
                 v = tuple(v)
             setattr(config, k, v)
@@ -637,7 +670,6 @@ def main():
         "grad_clip": args.grad_clip,
         "optimizer": args.optimizer,
         "scheduler": args.scheduler,
-        "warmup_epochs": args.warmup_epochs,
         "eta_min_ratio": args.eta_min_ratio,
         "use_ema": args.use_ema,
         "ema_decay": args.ema_decay,
