@@ -1,13 +1,9 @@
 """
-Visualize Diffusion Policy pada Push-T (keypoint + agent_pos, 20D).
-
-- Load checkpoint dari train_pusht.py terbaru
-- Rollout di gym_pusht, render ke GIF/MP4
-- DDIM sampling 10 langkah
-- Receding horizon: sample pred_horizon=16, eksekusi action_horizon=8
+Visualize Diffusion Policy Push-T (keypoint + agent_pos, 20D).
 
 Cara pakai:
-    uv run python visualize_policy.py --ckpt checkpoints/pusht_state_diffusion/epoch_0050_ema.pt --out rollout.gif
+    uv run python visualize_policy.py --ckpt checkpoints\pusht_state_diffusion\epoch_0020_ema.pt
+    uv run python visualize_policy.py --ckpt checkpoints\pusht_state_diffusion\epoch_0020_ema.pt --episodes 3 --out rollout.gif
 """
 from __future__ import annotations
 
@@ -30,30 +26,22 @@ from models.noise_schedule import NoiseScheduleCosine
 
 
 # ============================================================
-# Obs extraction (handle berbagai format gym_pusht)
+# Obs extraction
 # ============================================================
 def extract_obs_20d(obs, env=None) -> np.ndarray:
     """
-    Ubah obs dari gym_pusht menjadi vektor (20,) = keypoint(18) + agent_pos(2).
-
-    Handle:
-    - obs dict {'keypoint': (9,2) atau (18,), 'state': (5,) atau 'agent_pos': (2,)}
-    - obs array (18,) → ambil agent_pos dari env.unwrapped.state
-    - obs array (20,) → langsung pakai
-    - obs array (5,) → state, tapi keypoint dari env.unwrapped.keypoint
+    Ubah obs dari gym_pusht → vektor (20,) = keypoint(18) + agent_pos(2).
     """
     # --- Case 1: dict ---
     if isinstance(obs, dict):
-        kp = obs.get("keypoint", None)
-        st = obs.get("state", None)
-        ap = obs.get("agent_pos", None)
-
+        kp = obs.get("keypoint")
+        st = obs.get("state")
+        ap = obs.get("agent_pos")
         if kp is None:
-            raise ValueError("obs dict tidak punya key 'keypoint'")
-
+            raise ValueError(f"obs dict tidak punya 'keypoint'. Keys: {list(obs.keys())}")
         kp = np.asarray(kp, dtype=np.float32)
         if kp.ndim == 2 and kp.shape == (9, 2):
-            kp = kp.reshape(-1)          # (18,)
+            kp = kp.reshape(-1)
         elif kp.ndim == 1 and kp.size == 18:
             pass
         else:
@@ -65,12 +53,10 @@ def extract_obs_20d(obs, env=None) -> np.ndarray:
             agent_pos = np.asarray(ap, dtype=np.float32).flatten()[:2]
         else:
             raise ValueError("Tidak bisa extract agent_pos dari obs dict")
-
-        return np.concatenate([kp, agent_pos]).astype(np.float32)  # (20,)
+        return np.concatenate([kp, agent_pos]).astype(np.float32)
 
     # --- Case 2: array ---
     arr = np.asarray(obs, dtype=np.float32).flatten()
-
     if arr.size == 20:
         return arr
     if arr.size == 18:
@@ -82,11 +68,7 @@ def extract_obs_20d(obs, env=None) -> np.ndarray:
         if env is None:
             raise ValueError("Butuh env untuk extract keypoint")
         kp = np.asarray(env.unwrapped.keypoint, dtype=np.float32).flatten()
-        if kp.size != 18:
-            # kalau (9,2)
-            kp = kp.reshape(-1)
         return np.concatenate([kp, arr[:2]])
-
     raise ValueError(f"Bentuk obs tidak dikenal: {arr.shape}")
 
 
@@ -103,28 +85,24 @@ def ddim_sample(
     num_steps: int = 10,
     device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
-    """Sampling DDIM: dari noise murni → action (1, Ta, Da)."""
+    """DDIM: dari noise murni → action (B, Ta, Da)."""
     B = cond.shape[0]
     alpha_bar = noise_sched.alpha_bar
     T = alpha_bar.shape[0]
 
-    # Sub-sequence timesteps descending
     step_ratio = T // num_steps
     timesteps = (torch.arange(0, num_steps) * step_ratio).long()
-    timesteps = torch.flip(timesteps, dims=[0])
+    timesteps = torch.flip(timesteps, dims=[0])   # descending
 
     x = torch.randn(B, pred_horizon, action_dim, device=device)
 
     for i, t in enumerate(timesteps):
         t_val = int(t.item())
         a_t = alpha_bar[t_val].to(device)
-
         t_batch = torch.full((B,), t_val, device=device, dtype=torch.long)
 
-        # prediksi noise
         eps = model(x.permute(0, 2, 1), t_batch, cond).permute(0, 2, 1)
 
-        # x0_pred
         sqrt_a = torch.sqrt(a_t)
         sqrt_1ma = torch.sqrt(1.0 - a_t)
         x0 = (x - sqrt_1ma * eps) / sqrt_a
@@ -147,14 +125,17 @@ def load_policy(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
 
+    epoch = ckpt.get("epoch", "?")
+    train_loss = ckpt.get("train_loss", None)
+
     obs_dim = cfg.get("obs_dim", 20)
     obs_horizon = cfg.get("obs_horizon", 2)
     pred_horizon = cfg.get("pred_horizon", 16)
     input_dim = cfg.get("input_dim", 2)
     global_cond_dim = cfg.get("global_cond_dim", obs_horizon * obs_dim)
 
-    print(f"[Policy] epoch={ckpt.get('epoch')} | "
-          f"obs_dim={obs_dim} | obs_horizon={obs_horizon} | "
+    print(f"[Policy] epoch={epoch} | train_loss={train_loss}")
+    print(f"[Policy] obs_dim={obs_dim} | obs_horizon={obs_horizon} | "
           f"pred_horizon={pred_horizon} | global_cond_dim={global_cond_dim}")
 
     model = ConditionalUnet1D(
@@ -187,7 +168,23 @@ def load_policy(ckpt_path: str, device: torch.device):
 
 
 # ============================================================
-# Rollout satu episode
+# Render helper
+# ============================================================
+def _render(env) -> Optional[np.ndarray]:
+    try:
+        frame = env.render()
+    except Exception as e:
+        if not hasattr(_render, "_warned"):
+            print(f"[Render] Warning: {e}")
+            _render._warned = True
+        return None
+    if frame is None:
+        return None
+    return np.asarray(frame, dtype=np.uint8)
+
+
+# ============================================================
+# Rollout 1 episode
 # ============================================================
 def run_episode(
     env,
@@ -200,47 +197,35 @@ def run_episode(
     max_steps: int,
     num_inference_steps: int,
     action_horizon: int,
-) -> Tuple[List[np.ndarray], bool]:
+) -> Tuple[List[np.ndarray], bool, float]:
     obs_horizon = cfg.get("obs_horizon", 2)
     pred_horizon = cfg.get("pred_horizon", 16)
     input_dim = cfg.get("input_dim", 2)
 
-    # Reset env
-    try:
-        out = env.reset(seed=seed)
-    except TypeError:
-        out = env.reset()
+    out = env.reset(seed=seed)
     obs = out[0] if isinstance(out, tuple) else out
 
-    # Buffer obs
     obs_buffer: List[np.ndarray] = [extract_obs_20d(obs, env)]
 
     frames: List[np.ndarray] = []
+    f = _render(env)
+    if f is not None:
+        frames.append(f)
+
     done = False
     step = 0
-
-    # Render frame awal
-    frame = _render(env)
-    if frame is not None:
-        frames.append(frame)
+    max_coverage = 0.0
 
     while step < max_steps and not done:
-        # Pastikan buffer cukup
         while len(obs_buffer) < obs_horizon:
             obs_buffer.append(obs_buffer[-1])
 
         obs_seq = np.stack(obs_buffer[-obs_horizon:], axis=0)  # (To, 20)
-
-        # Normalize obs
         obs_norm = (
-            normalizer.normalize(obs_seq, "obs")
-            if normalizer is not None else obs_seq
+            normalizer.normalize(obs_seq, "obs") if normalizer else obs_seq
         )
-
-        # cond = flatten
         cond = torch.from_numpy(obs_norm).float().reshape(1, -1).to(device)
 
-        # Sampling action (1, Ta, Da)
         action_full = ddim_sample(
             model, noise_sched, cond,
             pred_horizon=pred_horizon,
@@ -248,30 +233,31 @@ def run_episode(
             num_steps=num_inference_steps,
             device=device,
         )
-
-        # Unnormalize
-        action_full_np = action_full[0].cpu().numpy()  # (Ta, 2)
-        if normalizer is not None:
+        action_full_np = action_full[0].cpu().numpy()   # (Ta, 2)
+        if normalizer:
             action_full_np = normalizer.unnormalize(action_full_np, "action")
 
-        # Eksekusi action_horizon langkah (receding horizon)
         exec_len = min(action_horizon, pred_horizon)
         for i in range(exec_len):
             if step >= max_steps:
                 break
 
             action = action_full_np[i].astype(np.float32)
-
             result = env.step(action)
-            if len(result) == 5:
-                obs, _, terminated, truncated, _ = result
-                done = bool(terminated or truncated)
-            else:  # 4-tuple
-                obs, _, done, _ = result
 
-            frame = _render(env)
-            if frame is not None:
-                frames.append(frame)
+            info = {}
+            if len(result) == 5:
+                obs, _, terminated, truncated, info = result
+                done = bool(terminated or truncated)
+            else:
+                obs, _, done, info = result
+
+            coverage = float(info.get("coverage", 0.0))
+            max_coverage = max(max_coverage, coverage)
+
+            f = _render(env)
+            if f is not None:
+                frames.append(f)
 
             obs_buffer.append(extract_obs_20d(obs, env))
             step += 1
@@ -279,23 +265,7 @@ def run_episode(
             if done:
                 break
 
-    return frames, done
-
-
-def _render(env) -> Optional[np.ndarray]:
-    """Ambil frame RGB dari env."""
-    try:
-        frame = env.render()
-    except Exception:
-        frame = None
-    if frame is None:
-        try:
-            frame = env.render(mode="rgb_array")
-        except Exception:
-            return None
-    if frame is None:
-        return None
-    return np.asarray(frame, dtype=np.uint8)
+    return frames, done, max_coverage
 
 
 # ============================================================
@@ -320,17 +290,8 @@ def save_frames(frames: List[np.ndarray], path: str, fps: int = 10):
             loop=0,
         )
     elif suffix in (".mp4", ".avi", ".mkv"):
-        try:
-            import imageio
-            imageio.mimsave(str(path), frames, fps=fps)
-        except ImportError:
-            print("[Warn] imageio tidak terpasang, fallback ke GIF")
-            path = path.with_suffix(".gif")
-            images = [Image.fromarray(f) for f in frames]
-            images[0].save(
-                str(path), save_all=True, append_images=images[1:],
-                duration=int(1000 / fps), loop=0,
-            )
+        import imageio
+        imageio.mimsave(str(path), frames, fps=fps)
     else:
         raise ValueError(f"Format tidak didukung: {suffix}")
 
@@ -344,18 +305,19 @@ def main():
     parser = argparse.ArgumentParser(
         description="Visualize Diffusion Policy Push-T (keypoint 20D)"
     )
-    parser.add_argument("--ckpt", type=str, required=True,
-                        help="Path ke checkpoint (.pt)")
-    parser.add_argument("--out", type=str, default="visualizations/rollout.gif",
-                        help="Output: .gif atau .mp4")
-    parser.add_argument("--episodes", type=int, default=3,
-                        help="Jumlah episode yang dijalankan")
+    parser.add_argument(
+        "--ckpt", type=str, required=True,
+        help="Path ke checkpoint (.pt)",
+    )
+    parser.add_argument(
+        "--out", type=str, default=None,
+        help="Output .gif atau .mp4. Default: visualizations/rollout_<ckpt>.gif",
+    )
+    parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-steps", type=int, default=300)
-    parser.add_argument("--num-inference-steps", type=int, default=10,
-                        help="Langkah DDIM (default 10)")
-    parser.add_argument("--action-horizon", type=int, default=8,
-                        help="Jumlah action yang dieksekusi per sampling")
+    parser.add_argument("--num-inference-steps", type=int, default=10)
+    parser.add_argument("--action-horizon", type=int, default=8)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
@@ -363,26 +325,28 @@ def main():
     device = get_device(prefer=args.device)
     print(f"[Device] {describe_device(device)}")
 
-    # Load policy
+    # --- Resolve output default ---
+    if args.out is None:
+        ckpt_stem = Path(args.ckpt).stem
+        args.out = f"visualizations/rollout_{ckpt_stem}.gif"
+
+    # --- Load policy ---
     model, noise_sched, normalizer, cfg = load_policy(args.ckpt, device)
 
-    # Env
-    try:
-        import gymnasium as gym
-        import gym_pusht  # noqa: F401
-    except ImportError:
-        import gym
-        import gym_pusht  # noqa: F401
+    # --- Env (coba obs_type="keypoint" dulu, fallback ke default) ---
+    import gymnasium as gym
+    import gym_pusht  # noqa
 
-    # Coba obs_type="keypoint" dulu, fallback ke default
     env = None
     for obs_type in ("keypoint", None):
         try:
             if obs_type is None:
-                env = gym.make("gym_pusht/PushT-v0")
+                env = gym.make("gym_pusht/PushT-v0", render_mode="rgb_array")
+                print("[Env] gym_pusht/PushT-v0 (obs_type=default)")
             else:
-                env = gym.make("gym_pusht/PushT-v0", obs_type=obs_type)
-            print(f"[Env] gym_pusht/PushT-v0 (obs_type={obs_type})")
+                env = gym.make("gym_pusht/PushT-v0", obs_type=obs_type,
+                               render_mode="rgb_array")
+                print(f"[Env] gym_pusht/PushT-v0 (obs_type={obs_type})")
             break
         except Exception as e:
             print(f"[Env] Gagal buat env obs_type={obs_type}: {e}")
@@ -392,12 +356,13 @@ def main():
         print("[Error] Tidak bisa membuat gym_pusht env")
         sys.exit(1)
 
+    # --- Rollout ---
     all_frames: List[np.ndarray] = []
     for ep in range(args.episodes):
         seed = args.seed + ep
         print(f"\n[Episode {ep+1}/{args.episodes}] seed={seed}")
         t0 = time.time()
-        frames, done = run_episode(
+        frames, done, cov = run_episode(
             env, model, noise_sched, normalizer, cfg,
             device=device,
             seed=seed,
@@ -406,12 +371,13 @@ def main():
             action_horizon=args.action_horizon,
         )
         elapsed = time.time() - t0
-        print(f"  frames={len(frames)} | done={done} | time={elapsed:.1f}s")
+        print(f"  frames={len(frames)} | done={done} | "
+              f"max_coverage={cov:.3f} | time={elapsed:.1f}s")
         all_frames.extend(frames)
 
     env.close()
 
-    # Simpan
+    # --- Save ---
     save_frames(all_frames, args.out, fps=args.fps)
 
 
